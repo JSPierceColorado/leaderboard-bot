@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-Daily buy of the top Coinbase Leaderboard asset (Most buyers or Highest buy ratio).
+Daily buy of the top Coinbase Leaderboard asset.
 
-- Scrapes the leaderboard with Playwright (headless Chromium + UA spoof, anti-automation tweaks).
-- Heuristics to grab the 1st row, extract ticker from row text or /price/<slug> link.
-- If scraping fails, supports TOP_TICKER_OVERRIDE.
-- Places a market IOC BUY for $BUY_USD into the chosen portfolio.
+This version parses the Next.js bootstrapped JSON (__NEXT_DATA__ / similar)
+instead of scraping visual elements. If it still can't find data, set
+TOP_TICKER_OVERRIDE=BTC for that run.
 
 Env:
   COINBASE_API_KEY, COINBASE_API_SECRET
@@ -15,43 +14,46 @@ Env:
   PORTFOLIO_UUID=<uuid>   # preferred
   PORTFOLIO_NAME=bot      # used only if UUID not set
   TOP_TICKER_OVERRIDE=    # e.g., BTC
-  DEBUG=1                 # verbose + write /tmp/leaderboard.html if scrape fails
+  DEBUG=1
 
-Build-time (for Playwright):
-  pip install playwright coinbase-advanced-py
+Requires:
+  pip install coinbase-advanced-py playwright
   python -m playwright install --with-deps chromium
 """
+
+import json
 import os
 import re
 import sys
 from decimal import Decimal, InvalidOperation
-from typing import Optional, List, Dict
+from typing import Any, Dict, List, Optional
 
 from coinbase.rest import RESTClient
 
-# ---------- Config ----------
-TOP_URLS = {
-    "most-buyers": "https://www.coinbase.com/leaderboards/most-buyers",
-    "highest-buy-ratio": "https://www.coinbase.com/leaderboards/highest-buy-ratio",
-}
 LEADERBOARD = os.getenv("LEADERBOARD", "most-buyers").strip().lower()
 BUY_USD_STR = os.getenv("BUY_USD", "5").strip()
 QUOTE       = os.getenv("QUOTE_CURRENCY", "USD").upper().strip()
 PORTFOLIO_UUID = os.getenv("PORTFOLIO_UUID", "").strip()
 PORTFOLIO_NAME = os.getenv("PORTFOLIO_NAME", "bot").strip() if not PORTFOLIO_UUID else ""
 TOP_OVERRIDE   = os.getenv("TOP_TICKER_OVERRIDE", "").strip().upper()
-DEBUG          = os.getenv("DEBUG", "0") not in ("0", "false", "False", "")
+DEBUG          = os.getenv("DEBUG", "0") not in ("0","false","False", "")
 
-client = RESTClient()
+URLS = {
+    "most-buyers": "https://www.coinbase.com/leaderboards/most-buyers",
+    "highest-buy-ratio": "https://www.coinbase.com/leaderboards/highest-buy-ratio",
+}
 
-# ---------- Logging ----------
+client = RESTClient()  # needs COINBASE_API_KEY/SECRET
+
+# -------------- logging --------------
 def log(msg: str) -> None:
     print(f"[cb-daily-buy] {msg}", flush=True)
+
 def dbg(msg: str) -> None:
     if DEBUG:
         print(f"[cb-daily-buy][debug] {msg}", flush=True)
 
-# ---------- Helpers ----------
+# -------------- helpers --------------
 def D(x: str) -> Decimal:
     try:
         return Decimal(str(x))
@@ -71,154 +73,164 @@ def ensure_portfolio_uuid() -> Optional[str]:
                 if PORTFOLIO_UUID:
                     log(f"Using portfolio '{PORTFOLIO_NAME}' ({PORTFOLIO_UUID})")
                     return PORTFOLIO_UUID
-        log(f"Portfolio named '{PORTFOLIO_NAME}' not found; will place order unscoped (default portfolio).")
+        log(f"Portfolio named '{PORTFOLIO_NAME}' not found; order will be unscoped (default portfolio).")
     except Exception as e:
         log(f"Error listing portfolios: {e}")
     return None
 
+def save_debug(page_html: str, next_json: Optional[dict]) -> None:
+    if not DEBUG:
+        return
+    try:
+        with open("/tmp/leaderboard.html", "w", encoding="utf-8") as f:
+            f.write(page_html)
+        dbg("Saved /tmp/leaderboard.html")
+    except Exception as e:
+        dbg(f"Saving HTML failed: {e}")
+    if next_json is not None:
+        try:
+            with open("/tmp/nextdata.json", "w", encoding="utf-8") as f:
+                json.dump(next_json, f, indent=2)
+            dbg("Saved /tmp/nextdata.json")
+        except Exception as e:
+            dbg(f"Saving JSON failed: {e}")
+
+def find_in_obj(obj: Any, predicate) -> List[Any]:
+    """DFS search returning all values for which predicate(value) is True."""
+    found = []
+    stack = [obj]
+    while stack:
+        cur = stack.pop()
+        try:
+            if predicate(cur):
+                found.append(cur)
+        except Exception:
+            pass
+        if isinstance(cur, dict):
+            stack.extend(cur.values())
+        elif isinstance(cur, list):
+            stack.extend(cur)
+    return found
+
 def map_slug_to_ticker(slug: str) -> Optional[str]:
-    """
-    Map a /price/<slug> to a tradable ticker (e.g., 'bitcoin' -> BTC) by scanning products.
-    Cached per run.
-    """
+    """Map a /price/<slug> to ticker via products list."""
     try:
         prods = client.get_products()
-        # Many SDKs return .products; others return list directly
         items = getattr(prods, "products", None) or getattr(prods, "data", None) or prods
-        # Slug may correspond to base_name/product_display_name
-        slug_l = slug.lower()
+        s = slug.lower()
         best = None
         for p in items:
             base = getattr(p, "base_currency_id", None) or p.get("base_currency_id")
-            disp = getattr(p, "display_name", None) or p.get("display_name")  # e.g., 'BTC-USD'
+            disp = getattr(p, "display_name", None) or p.get("display_name")  # e.g., BTC-USD
             base_name = getattr(p, "base_display_name", None) or p.get("base_display_name") or ""
-            product_id = getattr(p, "product_id", None) or p.get("product_id")
-            if not base or not product_id:
+            pid = getattr(p, "product_id", None) or p.get("product_id")
+            if not base or not pid:
                 continue
-            # Normalize
             tkr = str(base).upper()
-            dn  = str(disp or "")
-            bn  = str(base_name or "")
-            if slug_l in (dn.lower(), bn.lower(), tkr.lower(), product_id.lower(), product_id.split("-")[0].lower()):
+            dn  = (disp or "")
+            if s in (tkr.lower(), pid.lower(), pid.split("-")[0].lower(), base_name.lower(), dn.lower()):
                 return tkr
-            # Loose check: slug substring matches base name
-            if bn and slug_l in bn.lower():
+            if base_name and s in base_name.lower():
                 best = tkr
         return best
     except Exception as e:
         dbg(f"map_slug_to_ticker error: {e}")
         return None
 
-def extract_top_with_playwright(url: str) -> Optional[str]:
+def extract_top_from_nextdata(nextdata: dict) -> Optional[str]:
+    """
+    Try common Next.js shapes. We scan for arrays that look like leaderboard rows,
+    then pick the first row and extract symbol or /price/<slug>.
+    """
+    # Heuristic: find any list of rows where each row has a 'href' to /price/ or has a 'symbol'/'ticker' field.
+    def looks_like_row(x):
+        if not isinstance(x, dict):
+            return False
+        href = str(x.get("href") or x.get("link") or "")
+        sym  = x.get("symbol") or x.get("ticker") or x.get("base") or x.get("assetSymbol")
+        return (href.startswith("/price/") or sym)
+
+    candidates = find_in_obj(nextdata, lambda v: isinstance(v, list) and any(looks_like_row(el) for el in v))
+    for arr in candidates:
+        # pick the first row in each candidate array
+        row = arr[0] if arr else None
+        if not isinstance(row, dict):
+            continue
+        # 1) ticker present directly
+        sym = row.get("symbol") or row.get("ticker") or row.get("base") or row.get("assetSymbol")
+        if sym and isinstance(sym, str) and 2 <= len(sym) <= 10 and sym.isupper():
+            return sym
+        # 2) derive from /price/<slug>
+        href = str(row.get("href") or row.get("link") or "")
+        m = re.search(r"/price/([a-z0-9-]+)", href)
+        if m:
+            t = map_slug_to_ticker(m.group(1))
+            if t:
+                return t
+    return None
+
+def get_top_symbol_via_nextdata(url: str) -> Optional[str]:
     try:
-        from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+        from playwright.sync_api import sync_playwright
     except Exception as e:
-        dbg(f"Playwright not available: {e}")
+        dbg(f"Playwright unavailable: {e}")
         return None
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-blink-features=AutomationControlled",
-                "--disable-dev-shm-usage",
-            ],
-        )
+        browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
         ctx = browser.new_context(
             user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                         "AppleWebKit/537.36 (KHTML, like Gecko) "
                         "Chrome/124.0.0.0 Safari/537.36"),
-            locale="en-US",
-            timezone_id="UTC",
         )
-        # Hide webdriver flag
-        ctx.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
         page = ctx.new_page()
-        page.goto(url, wait_until="networkidle", timeout=90000)
+        page.goto(url, wait_until="domcontentloaded", timeout=90000)
 
-        # Try several selectors for the first row entry
+        # Try to read Next data via DOM
+        next_json = None
         selectors = [
-            # new leaderboard often uses role=list + role=listitem
-            "[role=list] [role=listitem] >> nth=0",
-            # generic table row
-            "table tr >> nth=1",  # skip header
-            # asset cards grid
-            "[data-testid*='Leaderboards'] [data-testid*='row'] >> nth=0",
-            # any clickable row with a link to /price/
-            "a[href^='/price/'] >> nth=0",
+            "script#__NEXT_DATA__",
+            "script[id='__NEXT_DATA__']",
+            "script[type='application/json']",
         ]
-
-        row_handle = None
         for sel in selectors:
             try:
-                row_handle = page.wait_for_selector(sel, timeout=5000)
-                if row_handle:
-                    dbg(f"Found selector: {sel}")
-                    break
-            except PWTimeout:
+                el = page.query_selector(sel)
+                if el:
+                    raw = el.inner_text()
+                    if raw and len(raw) > 20:
+                        next_json = json.loads(raw)
+                        break
+            except Exception:
                 continue
 
-        # Save snapshot for debugging
-        if DEBUG:
+        # Fallback: evaluate window.__NEXT_DATA__ if present
+        if next_json is None:
             try:
-                html = page.content()
-                with open("/tmp/leaderboard.html", "w", encoding="utf-8") as f:
-                    f.write(html)
-                dbg("Wrote /tmp/leaderboard.html")
-            except Exception as e:
-                dbg(f"snapshot write error: {e}")
+                next_json = page.evaluate("() => window.__NEXT_DATA__ || null")
+            except Exception:
+                pass
 
-        if not row_handle:
-            browser.close()
-            return None
-
-        # 1) Prefer link slug → ticker
-        try:
-            link = row_handle.query_selector("a[href^='/price/']")
-            if link:
-                href = link.get_attribute("href") or ""
-                m = re.search(r"/price/([a-z0-9-]+)", href)
-                if m:
-                    slug = m.group(1)
-                    tkr = map_slug_to_ticker(slug)
-                    if tkr:
-                        browser.close()
-                        return tkr
-        except Exception:
-            pass
-
-        # 2) Fallback: parse ticker from visible text
-        try:
-            text = row_handle.inner_text()
-        except Exception:
-            text = page.inner_text("body")
-        # find uppercase-ish token that looks like a ticker
-        tokens = re.findall(r"\b[A-Z0-9]{2,10}\b", text or "")
-        block = {"USD","USDT","USDC","BUY","RATIO","VOLUME","PRICE","MARKET","CAP","MOST","BUYERS"}
-        for tok in tokens:
-            if tok not in block and not tok.endswith("USD"):
-                browser.close()
-                return tok
-
+        html = page.content()
         browser.close()
+
+    save_debug(html, next_json)
+
+    if not next_json:
         return None
 
-def get_top_symbol() -> Optional[str]:
-    if TOP_OVERRIDE:
-        log(f"Using TOP_TICKER_OVERRIDE={TOP_OVERRIDE}")
-        return TOP_OVERRIDE
-    url = TOP_URLS.get(LEADERBOARD)
-    if not url:
-        log(f"Unknown LEADERBOARD='{LEADERBOARD}'. Choose one of: {list(TOP_URLS)}")
-        return None
-    log(f"Fetching top asset from: {url}")
-    sym = extract_top_with_playwright(url)
-    if sym:
-        log(f"Detected top ticker: {sym}")
-    else:
-        log("Could not detect top ticker via scraping.")
-    return sym
+    # Try a few common nesting roots
+    roots = [
+        next_json,
+        next_json.get("props", {}),
+        next_json.get("pageProps", {}),
+        (next_json.get("props", {}) or {}).get("pageProps", {}),
+    ]
+    for root in roots:
+        sym = extract_top_from_nextdata(root)
+        if sym:
+            return sym
+    return None
 
 def place_market_buy(symbol: str, usd_amount: Decimal, portfolio_uuid: Optional[str]) -> None:
     pid = f"{symbol}-{QUOTE}"
@@ -246,7 +258,17 @@ def main():
     log(f"Started | leaderboard={LEADERBOARD} | buy=${usd_amt} | quote={QUOTE}")
     pf = ensure_portfolio_uuid()
 
-    sym = get_top_symbol()
+    if TOP_OVERRIDE:
+        log(f"Using TOP_TICKER_OVERRIDE={TOP_OVERRIDE}")
+        sym = TOP_OVERRIDE
+    else:
+        url = URLS.get(LEADERBOARD)
+        if not url:
+            log(f"Unknown LEADERBOARD='{LEADERBOARD}'. Choose one of: {list(URLS)}")
+            sys.exit(1)
+        log(f"Fetching top asset from: {url}")
+        sym = get_top_symbol_via_nextdata(url)
+
     if not sym:
         log("No symbol found; aborting.")
         sys.exit(1)
