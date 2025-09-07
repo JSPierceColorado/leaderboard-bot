@@ -4,14 +4,14 @@ Daily buy of the highest buy/sell ratio USD asset on Coinbase.
 
 Flow
 ----
-1) List tradable USD products from Advanced Trade:
-     GET /api/v3/brokerage/products   (paginated)
+1) List tradable USD products from Advanced Trade (paginated):
+     GET /api/v3/brokerage/products
 2) Keep top-N by 24h volume (reduces API calls).
-3) For each candidate, fetch most-recent public trades from the Exchange API:
+3) For each candidate, fetch most recent public trades from the Exchange API:
      GET https://api.exchange.coinbase.com/products/{product_id}/trades?limit=100
 4) Compute buy_ratio = buy_base_volume / (buy + sell base volume).
 5) Pick the highest buy_ratio (tie-break by 24h volume) and place a $BUY_USD
-   market IOC via Advanced Trade.
+   market IOC via Advanced Trade, scoped to your portfolio via QUERY PARAM.
 
 Env
 ---
@@ -27,7 +27,7 @@ MAX_PRODUCTS=60                      # scan top-N by 24h volume
 TRADES_LIMIT=100                     # Exchange endpoint typical max ~100
 MIN_TRADES=30                        # minimum trades to accept ratio
 DENYLIST=USDC,USDT,EURT,WBTC         # skip these tickers by default
-ALLOWLIST=                            # if set (comma-separated), only pick from these tickers
+ALLOWLIST=                            # if set, only pick from these tickers
 TOP_TICKER_OVERRIDE=                  # e.g., BTC (forces selection)
 DEBUG=1
 
@@ -38,6 +38,7 @@ pip install coinbase-advanced-py>=1.6.3 requests>=2.32.0
 
 import os
 import time
+import uuid
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -237,26 +238,46 @@ def pick_top_by_ratio(products: List[dict]) -> Optional[Tuple[str, str, Decimal,
     return (best[0], best[1], best[2], best[3]) if best else None
 
 # ---------------- Trading (Advanced Trade) ----------------
+def _make_order_payload(product_id: str, usd_amount: Decimal) -> dict:
+    return {
+        "product_id": product_id,
+        "side": "BUY",
+        "client_order_id": str(uuid.uuid4()),  # ensure a valid UUIDv4
+        "order_configuration": {
+            "market_market_ioc": {"quote_size": f"{usd_amount.normalize():f}"}
+        },
+    }
+
 def place_market_buy(product_id: str, usd_amount: Decimal, portfolio_uuid: Optional[str]) -> None:
     """
     Submit a market IOC BUY using quote_size=$, scoped by portfolio via QUERY PARAM.
     NOTE: 'portfolio_id' must NOT be in the JSON body (it will 400).
+    Also explicitly provide a valid UUIDv4 client_order_id to avoid SDK auto-inject quirks.
     """
-    payload = {
-        "product_id": product_id,
-        "side": "BUY",
-        "order_configuration": {"market_market_ioc": {"quote_size": f"{usd_amount.normalize():f}"}},
-    }
     params = {}
     if portfolio_uuid:
         params["portfolio_id"] = portfolio_uuid
+
+    payload = _make_order_payload(product_id, usd_amount)
 
     try:
         resp = client.post("/api/v3/brokerage/orders", params=params, data=payload)
         oid = (_get(resp, "order_id") or _get(resp, "orderId")
                or _get(_get(resp, "success_response", {}) or {}, "order_id"))
         log(f"{product_id} | BUY ${usd_amount} submitted (order {oid})")
+        return
     except Exception as e:
+        # If server complains about client_order_id, retry once with a fresh UUID
+        msg = str(e)
+        if "client_order_id" in msg:
+            dbg(f"{product_id} | retrying with fresh client_order_id due to error: {e}")
+            payload = _make_order_payload(product_id, usd_amount)
+            resp = client.post("/api/v3/brokerage/orders", params=params, data=payload)
+            oid = (_get(resp, "order_id") or _get(resp, "orderId")
+                   or _get(_get(resp, "success_response", {}) or {}, "order_id"))
+            log(f"{product_id} | BUY ${usd_amount} submitted on retry (order {oid})")
+            return
+        # otherwise re-raise
         log(f"{product_id} | BUY failed: {type(e).__name__}: {e}")
         raise
 
