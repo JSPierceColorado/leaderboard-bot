@@ -1,35 +1,42 @@
 #!/usr/bin/env python3
 """
-Daily buy of the highest buy/sell ratio USD asset on Coinbase Advanced Trade.
+Daily buy of the highest buy/sell ratio USD asset on Coinbase.
 
-Approach:
-  1) List tradable, online USD products (e.g., BTC-USD).
-  2) Prefilter to top-N by 24h volume (keeps API calls reasonable).
-  3) For each candidate, fetch recent public trades and compute:
-        buy_ratio = sum(base_size on BUY trades) / sum(base_size on all trades)
-  4) Pick the highest buy_ratio (tie-breaker: 24h volume), then BUY $BUY_USD (market IOC).
+What it does
+------------
+1) Lists tradable, online USD products from Advanced Trade:
+     GET /api/v3/brokerage/products   (with pagination)
+2) Keeps the top-N by 24h volume (reduce API calls).
+3) For each candidate, fetches most recent public trades from the Exchange API:
+     GET https://api.exchange.coinbase.com/products/{product_id}/trades
+   (no auth required; pure market data)
+4) Computes buy_ratio = buy_base_volume / (buy + sell base volume).
+5) Picks the highest buy_ratio (tie-break by 24h volume) and places a $ BUY
+   as a market IOC via Advanced Trade.
 
-Env:
-  COINBASE_API_KEY=...
-  COINBASE_API_SECRET=...
+Env
+---
+COINBASE_API_KEY=...
+COINBASE_API_SECRET=...
 
-  BUY_USD=5                       # $ per run
-  QUOTE_CURRENCY=USD              # fixed to USD markets
-  PORTFOLIO_UUID=<uuid>           # preferred
-  PORTFOLIO_NAME=bot              # used only if UUID not set
+BUY_USD=5
+QUOTE_CURRENCY=USD
+PORTFOLIO_UUID=<uuid>                # preferred
+PORTFOLIO_NAME=bot                   # used only if UUID not set
 
-  # Universe controls:
-  MAX_PRODUCTS=60                 # scan top-N by 24h volume
-  TRADES_LIMIT=250                # recent trades fetched per product
-  MIN_TRADES=30                   # require at least this many trades to accept a ratio
-  DENYLIST=USDC,USDT,EURT,WBTC    # skip these tickers (default excludes stables/wrapped)
-  ALLOWLIST=                      # if set, only pick from these tickers
-  TOP_TICKER_OVERRIDE=            # e.g., BTC (bypass selection entirely)
+# Universe controls
+MAX_PRODUCTS=60                      # scan top-N by 24h volume
+TRADES_LIMIT=100                     # Exchange public trades endpoint returns up to ~100 per call
+MIN_TRADES=30                        # require at least this many trades for a valid ratio
+DENYLIST=USDC,USDT,EURT,WBTC         # skip these tickers
+ALLOWLIST=                            # if set, only pick from these tickers
+TOP_TICKER_OVERRIDE=                  # e.g., BTC (bypass selection)
 
-  DEBUG=1
+DEBUG=1
 
-Requires:
-  pip install coinbase-advanced-py>=1.6.3
+Requirements
+------------
+pip install coinbase-advanced-py>=1.6.3 requests>=2.32.0
 """
 
 import os
@@ -37,6 +44,7 @@ import time
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional, Tuple
 
+import requests
 from coinbase.rest import RESTClient
 
 # ---------------- Config ----------------
@@ -45,7 +53,7 @@ QUOTE           = os.getenv("QUOTE_CURRENCY", "USD").upper().strip()
 PORTFOLIO_UUID  = os.getenv("PORTFOLIO_UUID", "").strip()
 PORTFOLIO_NAME  = os.getenv("PORTFOLIO_NAME", "bot").strip() if not PORTFOLIO_UUID else ""
 MAX_PRODUCTS    = int(os.getenv("MAX_PRODUCTS", "60"))
-TRADES_LIMIT    = int(os.getenv("TRADES_LIMIT", "250"))
+TRADES_LIMIT    = int(os.getenv("TRADES_LIMIT", "100"))   # Exchange API typical max ~100
 MIN_TRADES      = int(os.getenv("MIN_TRADES", "30"))
 TOP_OVERRIDE    = os.getenv("TOP_TICKER_OVERRIDE", "").strip().upper()
 DENYLIST        = {s.strip().upper() for s in os.getenv("DENYLIST", "USDC,USDT,EURT,WBTC").split(",") if s.strip()}
@@ -94,14 +102,28 @@ def ensure_portfolio_uuid() -> Optional[str]:
         log(f"Error listing portfolios: {e}")
     return None
 
-# ---------------- Market universe ----------------
+# ---------------- Advanced Trade: products (correct path, with pagination) ----------------
+def fetch_all_products() -> List[dict]:
+    items: List[dict] = []
+    cursor = None
+    while True:
+        params = {"limit": 250}
+        if cursor:
+            params["cursor"] = cursor
+        res = client.get("/api/v3/brokerage/products", params=params)
+        page = _get(res, "products") or _get(res, "data") or []
+        items.extend(page)
+        cursor = _get(res, "cursor") or _get(res, "next") or _get(res, "next_cursor")
+        if not cursor:
+            break
+    return items
+
 def fetch_usd_products() -> List[dict]:
     """Get tradable online USD products, honoring allow/deny lists, sorted by 24h volume."""
     try:
-        res = client.get("/api/v3/brokerage/market/products", params={"limit": 250})
-        prods = _get(res, "products") or _get(res, "data") or _get(res, "list") or []
+        prods = fetch_all_products()
     except Exception:
-        # Fallback to SDK helper
+        # Fallback to SDK helper if needed
         res = client.get_products()
         prods = _get(res, "products") or _get(res, "data") or res
 
@@ -133,24 +155,45 @@ def fetch_usd_products() -> List[dict]:
     dbg(f"USD products considered: {len(usd_products)} (top by 24h volume)")
     return usd_products
 
-# ---------------- Buy ratio (from trades) ----------------
-def get_trades(pid: str, limit: int) -> List[dict]:
-    """Fetch recent public trades for a product."""
+# ---------------- Exchange public API: trades ----------------
+EXCHANGE_BASE = "https://api.exchange.coinbase.com"
+
+def get_trades_exchange(pid: str, limit: int) -> List[dict]:
+    """
+    Fetch recent public trades from Coinbase Exchange market data API.
+    Example: GET https://api.exchange.coinbase.com/products/BTC-USD/trades?limit=100
+    """
+    url = f"{EXCHANGE_BASE}/products/{pid}/trades"
+    headers = {
+        "User-Agent": "cb-buyratio-bot/1.0",
+        "Accept": "application/json",
+    }
+    params = {"limit": max(1, min(limit, 100))}
     try:
-        res = client.get(f"/api/v3/brokerage/market/products/{pid}/trades", params={"limit": limit})
-        return _get(res, "trades") or _get(res, "data") or []
+        r = requests.get(url, headers=headers, params=params, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        if isinstance(data, list):
+            return data
+        return []
     except Exception as e:
-        dbg(f"{pid} | trades fetch error: {e}")
+        dbg(f"{pid} | exchange trades fetch error: {e}")
         return []
 
-def compute_buy_ratio(pid: str, trades: List[dict]) -> Tuple[Optional[Decimal], int, Decimal, Decimal]:
+def compute_buy_ratio_from_trades(trades: List[dict]) -> Tuple[Optional[Decimal], int, Decimal, Decimal]:
     """Return (buy_ratio [0..1], n_trades, buy_vol, sell_vol); None if insufficient trades."""
     buy_vol = Decimal(0)
     sell_vol = Decimal(0)
     n = 0
     for t in trades:
-        side = str(_get(t, "side") or _get(t, "trade_side") or "").upper()
-        raw_size = _get(t, "size") or _get(t, "base_size") or _get(t, "trade_size")
+        side = str(_get(t, "side") or "").upper()   # 'BUY'/'SELL' on Exchange API is usually lower-case
+        if side == "BUY" or side == "buy":
+            side = "BUY"
+        elif side == "SELL" or side == "sell":
+            side = "SELL"
+        else:
+            continue
+        raw_size = _get(t, "size") or _get(t, "base_size")
         try:
             sz = D(str(raw_size))
         except Exception:
@@ -159,10 +202,8 @@ def compute_buy_ratio(pid: str, trades: List[dict]) -> Tuple[Optional[Decimal], 
             continue
         if side == "BUY":
             buy_vol += sz
-        elif side == "SELL":
-            sell_vol += sz
         else:
-            continue
+            sell_vol += sz
         n += 1
 
     total = buy_vol + sell_vol
@@ -172,7 +213,7 @@ def compute_buy_ratio(pid: str, trades: List[dict]) -> Tuple[Optional[Decimal], 
 
 def pick_top_by_ratio(products: List[dict]) -> Optional[Tuple[str, Decimal, int]]:
     """
-    Compute ratio for each candidate, return (symbol, ratio, n_trades) for the best.
+    Compute ratio for each candidate using Exchange trades, return (symbol, ratio, n_trades).
     Tie-breaker: 24h volume (desc).
     """
     best: Optional[Tuple[str, Decimal, int, Decimal]] = None  # (base, ratio, n_trades, vol24h)
@@ -190,8 +231,8 @@ def pick_top_by_ratio(products: List[dict]) -> Optional[Tuple[str, Decimal, int]
         if not pid or not base:
             continue
 
-        trades = get_trades(pid, TRADES_LIMIT)
-        ratio, n, buy_vol, sell_vol = compute_buy_ratio(pid, trades)
+        trades = get_trades_exchange(pid, TRADES_LIMIT)
+        ratio, n, buy_vol, sell_vol = compute_buy_ratio_from_trades(trades)
         if ratio is None:
             dbg(f"{pid} | insufficient trades (n={n}); skip.")
             continue
@@ -200,12 +241,11 @@ def pick_top_by_ratio(products: List[dict]) -> Optional[Tuple[str, Decimal, int]
         if best is None or (ratio > best[1]) or (ratio == best[1] and vol24 > best[3]):
             best = (base, ratio, n, vol24)
 
-        # small sleep to be gentle with rate limits
-        time.sleep(0.05)
+        time.sleep(0.05)  # gentle on rate limits
 
     return (best[0], best[1], best[2]) if best else None
 
-# ---------------- Trading ----------------
+# ---------------- Trading (Advanced Trade order) ----------------
 def place_market_buy(symbol: str, usd_amount: Decimal, portfolio_uuid: Optional[str]) -> None:
     pid = f"{symbol}-{QUOTE}"
     payload = {
