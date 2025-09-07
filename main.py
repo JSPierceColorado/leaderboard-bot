@@ -1,56 +1,68 @@
 #!/usr/bin/env python3
 """
-Daily buy of the top Coinbase Leaderboard asset — NO Playwright required.
+Daily buy of the highest buy/sell ratio USD asset on Coinbase Advanced Trade.
 
-Strategy:
-- Fetch the leaderboard HTML with requests.
-- Parse the embedded Next.js JSON (__NEXT_DATA__) to find the first row.
-- Resolve the ticker (symbol) and place a $ BUY via Coinbase Advanced Trade.
-- Scoped to a specific portfolio if PORTFOLIO_UUID is provided (or look up by PORTFOLIO_NAME).
+Approach:
+  1) List tradable, online USD products (e.g., BTC-USD).
+  2) Prefilter to top-N by 24h volume (to avoid hammering every microcap).
+  3) For each candidate, fetch recent market trades and compute:
+        buy_ratio = sum(base_size on BUY trades) / sum(base_size on all trades)
+  4) Pick the highest buy_ratio (tie-break on 24h volume), then BUY $BUY_USD at market (IOC).
 
 Env:
-  COINBASE_API_KEY, COINBASE_API_SECRET
-  LEADERBOARD=most-buyers | highest-buy-ratio   (default: most-buyers)
-  BUY_USD=5
-  QUOTE_CURRENCY=USD
-  PORTFOLIO_UUID=<uuid>                         (preferred)
-  PORTFOLIO_NAME=bot                            (used only if UUID not set)
-  TOP_TICKER_OVERRIDE=                          (e.g., BTC; bypass scraping)
+  COINBASE_API_KEY=...
+  COINBASE_API_SECRET=...
+
+  BUY_USD=5                       # $ per run
+  QUOTE_CURRENCY=USD              # fixed to USD markets
+  PORTFOLIO_UUID=<uuid>           # preferred
+  PORTFOLIO_NAME=bot              # used only if UUID not set
+
+  # Universe controls:
+  MAX_PRODUCTS=60                 # scan top-N by 24h volume
+  TRADES_LIMIT=250                # recent trades fetched per product (max recommended)
+  MIN_TRADES=30                   # require at least this many trades to accept a ratio
+  DENYLIST=USDC,USDT,EURT,WBTC    # skip these tickers (default excludes stables/wrapped)
+  ALLOWLIST=                      # if set (comma-separated tickers), only scan these
+  TOP_TICKER_OVERRIDE=            # e.g. BTC (bypass selection entirely)
+
+  # Misc:
   DEBUG=1
+
+Requires:
+  pip install coinbase-advanced-py>=1.6.3
 """
 
 import os
-import re
-import sys
-import json
-from typing import Any, Dict, List, Optional
+import time
 from decimal import Decimal, InvalidOperation
+from typing import Any, Dict, List, Optional, Tuple
 
-import requests
-from coinbase.rest import RESTClient  # pip install coinbase-advanced-py
+from coinbase.rest import RESTClient
 
-LEADERBOARD = os.getenv("LEADERBOARD", "most-buyers").strip().lower()
-BUY_USD_STR = os.getenv("BUY_USD", "5").strip()
-QUOTE       = os.getenv("QUOTE_CURRENCY", "USD").upper().strip()
-PORTFOLIO_UUID = os.getenv("PORTFOLIO_UUID", "").strip()
-PORTFOLIO_NAME = os.getenv("PORTFOLIO_NAME", "bot").strip() if not PORTFOLIO_UUID else ""
-TOP_OVERRIDE   = os.getenv("TOP_TICKER_OVERRIDE", "").strip().upper()
-DEBUG          = os.getenv("DEBUG", "0") not in ("0","false","False", "")
+# ---------------- Config ----------------
+BUY_USD_STR     = os.getenv("BUY_USD", "5").strip()
+QUOTE           = os.getenv("QUOTE_CURRENCY", "USD").upper().strip()
+PORTFOLIO_UUID  = os.getenv("PORTFOLIO_UUID", "").strip()
+PORTFOLIO_NAME  = os.getenv("PORTFOLIO_NAME", "bot").strip() if not PORTFOLIO_UUID else ""
+MAX_PRODUCTS    = int(os.getenv("MAX_PRODUCTS", "60"))
+TRADES_LIMIT    = int(os.getenv("TRADES_LIMIT", "250"))
+MIN_TRADES      = int(os.getenv("MIN_TRADES", "30"))
+TOP_OVERRIDE    = os.getenv("TOP_TICKER_OVERRIDE", "").strip().upper()
+DENYLIST        = {s.strip().upper() for s in os.getenv("DENYLIST", "USDC,USDT,EURT,WBTC").split(",") if s.strip()}
+ALLOWLIST_RAW   = os.getenv("ALLOWLIST", "").strip()
+ALLOWLIST       = {s.strip().upper() for s in ALLOWLIST_RAW.split(",") if s.strip()} if ALLOWLIST_RAW else set()
+DEBUG           = os.getenv("DEBUG", "0") not in ("0","false","False",""))
 
-URLS = {
-    "most-buyers": "https://www.coinbase.com/leaderboards/most-buyers",
-    "highest-buy-ratio": "https://www.coinbase.com/leaderboards/highest-buy-ratio",
-}
-
-client = RESTClient()  # requires COINBASE_API_KEY / COINBASE_API_SECRET
+client = RESTClient()  # uses COINBASE_API_KEY / COINBASE_API_SECRET
 
 # ---------------- Logging ----------------
 def log(msg: str) -> None:
-    print(f"[cb-daily-buy] {msg}", flush=True)
+    print(f"[cb-buyratio] {msg}", flush=True)
 
 def dbg(msg: str) -> None:
     if DEBUG:
-        print(f"[cb-daily-buy][debug] {msg}", flush=True)
+        print(f"[cb-buyratio][debug] {msg}", flush=True)
 
 # ---------------- Helpers ----------------
 def D(x: str) -> Decimal:
@@ -59,16 +71,22 @@ def D(x: str) -> Decimal:
     except InvalidOperation:
         raise SystemExit(f"Invalid decimal: {x}")
 
+def _get(o: Any, k: str, default=None):
+    if isinstance(o, dict):
+        return o.get(k, default)
+    return getattr(o, k, default)
+
 def ensure_portfolio_uuid() -> Optional[str]:
+    """Return portfolio UUID; prefer env, else look up by name."""
     global PORTFOLIO_UUID
     if PORTFOLIO_UUID:
         return PORTFOLIO_UUID
     try:
         res = client.get("/api/v3/brokerage/portfolios")
-        ports = res.get("portfolios") or res.get("data") or []
+        ports = _get(res, "portfolios") or _get(res, "data") or []
         for p in ports:
-            if str(p.get("name","")).strip().lower() == PORTFOLIO_NAME.lower():
-                PORTFOLIO_UUID = p.get("uuid") or p.get("portfolio_uuid")
+            if str(_get(p, "name") or "").strip().lower() == PORTFOLIO_NAME.lower():
+                PORTFOLIO_UUID = _get(p, "uuid") or _get(p, "portfolio_uuid")
                 if PORTFOLIO_UUID:
                     log(f"Using portfolio '{PORTFOLIO_NAME}' ({PORTFOLIO_UUID})")
                     return PORTFOLIO_UUID
@@ -77,158 +95,131 @@ def ensure_portfolio_uuid() -> Optional[str]:
         log(f"Error listing portfolios: {e}")
     return None
 
-def http_get(url: str) -> str:
-    headers = {
-        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                       "AppleWebKit/537.36 (KHTML, like Gecko) "
-                       "Chrome/124.0.0.0 Safari/537.36"),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-    r = requests.get(url, headers=headers, timeout=30)
-    r.raise_for_status()
-    return r.text
+# ---------------- Market universe ----------------
+def fetch_usd_products() -> List[dict]:
+    """
+    Get all market products and return those with USD quote,
+    that are online & tradable, honoring allow/deny lists.
+    """
+    try:
+        res = client.get("/api/v3/brokerage/market/products", params={"limit": 250})
+        prods = _get(res, "products") or _get(res, "data") or _get(res, "list") or []
+    except Exception:
+        # Fallback to SDK helper
+        res = client.get_products()
+        prods = _get(res, "products") or _get(res, "data") or res
 
-def extract_nextdata(html: str) -> Optional[dict]:
-    """
-    Extract Next.js bootstrapped JSON from a <script id="__NEXT_DATA__"> tag.
-    """
-    # Save debug HTML if requested
-    if DEBUG:
+    usd_products = []
+    for p in prods:
+        pid    = str(_get(p, "product_id") or "")
+        quote  = str(_get(p, "quote_currency_id") or _get(p, "quote_currency") or "").upper()
+        base   = str(_get(p, "base_currency_id") or _get(p, "base_currency") or "").upper()
+        status = str(_get(p, "status") or _get(p, "status_message") or "online").lower()
+        tradable = bool(_get(p, "is_tradable", True))
+        if not pid or quote != QUOTE or not tradable or "offline" in status:
+            continue
+        if ALLOWLIST and base not in ALLOWLIST:
+            continue
+        if base in DENYLIST:
+            continue
+        usd_products.append(p)
+
+    # Sort by 24h volume desc and keep top N to reduce API calls
+    def dec(v) -> Decimal:
         try:
-            with open("/tmp/leaderboard.html", "w", encoding="utf-8") as f:
-                f.write(html)
-            dbg("Saved /tmp/leaderboard.html")
-        except Exception as e:
-            dbg(f"Saving HTML failed: {e}")
+            return D(str(v))
+        except Exception:
+            return Decimal(0)
+    usd_products.sort(key=lambda p: dec(_get(p, "volume_24h")), reverse=True)
+    if MAX_PRODUCTS and len(usd_products) > MAX_PRODUCTS:
+        usd_products = usd_products[:MAX_PRODUCTS]
 
-    # Try a precise search first
-    m = re.search(r'<script[^>]+id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, flags=re.DOTALL|re.IGNORECASE)
-    if not m:
-        # Try generic JSON script (some builds use type="application/json")
-        m = re.search(r'<script[^>]+type="application/json"[^>]*>(.*?)</script>', html, flags=re.DOTALL|re.IGNORECASE)
-    if not m:
-        return None
+    dbg(f"USD products considered: {len(usd_products)} (top by 24h volume)")
+    return usd_products
 
-    raw = m.group(1).strip()
+# ---------------- Buy ratio (from trades) ----------------
+def get_trades(pid: str, limit: int) -> List[dict]:
+    """
+    Fetch recent market trades for a product.
+    Endpoint: /api/v3/brokerage/market/products/{pid}/trades
+    """
     try:
-        data = json.loads(raw)
-        # Also dump JSON if debugging
-        if DEBUG:
-            try:
-                with open("/tmp/nextdata.json", "w", encoding="utf-8") as f:
-                    json.dump(data, f, indent=2)
-                dbg("Saved /tmp/nextdata.json")
-            except Exception as e:
-                dbg(f"Saving JSON failed: {e}")
-        return data
+        res = client.get(f"/api/v3/brokerage/market/products/{pid}/trades", params={"limit": limit})
+        trades = _get(res, "trades") or _get(res, "data") or []
+        return trades
     except Exception as e:
-        dbg(f"Failed to parse __NEXT_DATA__: {e}")
-        return None
+        dbg(f"{pid} | trades fetch error: {e}")
+        return []
 
-def looks_like_row(x: Any) -> bool:
-    if not isinstance(x, dict):
-        return False
-    if x.get("symbol") or x.get("ticker") or x.get("base") or x.get("assetSymbol"):
-        return True
-    href = str(x.get("href") or x.get("link") or "")
-    if href.startswith("/price/"):
-        return True
-    return False
+def compute_buy_ratio(pid: str, trades: List[dict]) -> Tuple[Optional[Decimal], int, Decimal, Decimal]:
+    """
+    Return (buy_ratio, n_trades, buy_vol, sell_vol)
+    buy_ratio in [0,1] based on base-size volume. None if insufficient trades.
+    """
+    buy_vol = Decimal(0)
+    sell_vol = Decimal(0)
+    n = 0
+    for t in trades:
+        side = str(_get(t, "side") or _get(t, "trade_side") or "").upper()
+        # Base size field may be "size" or "trade_size" or "base_size"
+        raw_size = _get(t, "size") or _get(t, "base_size") or _get(t, "trade_size")
+        try:
+            sz = D(str(raw_size))
+        except Exception:
+            continue
+        if sz <= 0:
+            continue
+        if side == "BUY":
+            buy_vol += sz
+        elif side == "SELL":
+            sell_vol += sz
+        else:
+            # Unknown side → skip
+            continue
+        n += 1
 
-def find_row_arrays(obj: Any) -> List[List[dict]]:
-    found: List[List[dict]] = []
-    stack = [obj]
-    while stack:
-        cur = stack.pop()
-        if isinstance(cur, list) and any(isinstance(el, dict) and looks_like_row(el) for el in cur):
-            found.append(cur)
-        if isinstance(cur, dict):
-            stack.extend(cur.values())
-        elif isinstance(cur, list):
-            stack.extend(cur)
-    return found
+    total = buy_vol + sell_vol
+    if n < MIN_TRADES or total <= 0:
+        return (None, n, buy_vol, sell_vol)
+    return (buy_vol / total, n, buy_vol, sell_vol)
 
-def map_slug_to_ticker(slug: str) -> Optional[str]:
-    """Map a /price/<slug> to a tradable base ticker via products list."""
-    try:
-        prods = client.get_products()
-        items = getattr(prods, "products", None) or getattr(prods, "data", None) or prods
-        s = slug.lower()
-        best = None
-        for p in items:
-            base = getattr(p, "base_currency_id", None) or p.get("base_currency_id")
-            disp = getattr(p, "display_name", None) or p.get("display_name")
-            base_name = getattr(p, "base_display_name", None) or p.get("base_display_name") or ""
-            pid = getattr(p, "product_id", None) or p.get("product_id")
-            if not base or not pid:
-                continue
-            tkr = str(base).upper()
-            dn  = str(disp or "")
-            if s in (tkr.lower(), pid.lower(), pid.split("-")[0].lower(), base_name.lower(), dn.lower()):
-                return tkr
-            if base_name and s in base_name.lower():
-                best = tkr
-        return best
-    except Exception as e:
-        dbg(f"map_slug_to_ticker error: {e}")
-        return None
+def pick_top_by_ratio(products: List[dict]) -> Optional[Tuple[str, Decimal, int]]:
+    """
+    Iterate candidates, compute buy_ratio, pick the best.
+    Tie-breaker: 24h volume (descending).
+    Returns (symbol, buy_ratio, n_trades).
+    """
+    best: Optional[Tuple[str, Decimal, int, Decimal]] = None  # (base, ratio, n_trades, vol24h)
 
-def resolve_row_symbol(row: dict) -> Optional[str]:
-    sym = row.get("symbol") or row.get("ticker") or row.get("base") or row.get("assetSymbol")
-    if isinstance(sym, str) and 2 <= len(sym) <= 10 and sym.isupper():
-        return sym
-    href = str(row.get("href") or row.get("link") or "")
-    m = re.search(r"/price/([a-z0-9-]+)", href)
-    if m:
-        return map_slug_to_ticker(m.group(1))
-    return None
+    def dec(v) -> Decimal:
+        try:
+            return D(str(v))
+        except Exception:
+            return Decimal(0)
 
-def parse_nextdata_for_top_symbol(nextdata: dict) -> Optional[str]:
-    # Try common roots
-    roots = [
-        nextdata,
-        nextdata.get("props", {}),
-        nextdata.get("pageProps", {}),
-        (nextdata.get("props", {}) or {}).get("pageProps", {}),
-    ]
-    for root in roots:
-        arrays = find_row_arrays(root)
-        for arr in arrays:
-            if not arr:
-                continue
-            row = arr[0]
-            if isinstance(row, dict):
-                sym = resolve_row_symbol(row)
-                if sym:
-                    return sym
-    return None
+    for p in products:
+        pid  = str(_get(p, "product_id") or "")
+        base = str(_get(p, "base_currency_id") or _get(p, "base_currency") or "").upper()
+        vol24= dec(_get(p, "volume_24h"))
+        if not pid or not base:
+            continue
 
-def get_top_symbol() -> Optional[str]:
-    if TOP_OVERRIDE:
-        log(f"Using TOP_TICKER_OVERRIDE={TOP_OVERRIDE}")
-        return TOP_OVERRIDE
-    url = URLS.get(LEADERBOARD)
-    if not url:
-        log(f"Unknown LEADERBOARD='{LEADERBOARD}'. Choose one of: {list(URLS)}")
-        return None
-    log(f"Fetching top asset from: {url}")
-    try:
-        html = http_get(url)
-    except Exception as e:
-        log(f"HTTP fetch failed: {type(e).__name__}: {e}")
-        return None
-    nextdata = extract_nextdata(html)
-    if not nextdata:
-        log("No __NEXT_DATA__ JSON found.")
-        return None
-    sym = parse_nextdata_for_top_symbol(nextdata)
-    if sym:
-        log(f"Detected top ticker: {sym}")
-    else:
-        log("Could not detect top ticker in embedded JSON.")
-    return sym
+        trades = get_trades(pid, TRADES_LIMIT)
+        ratio, n, buy_vol, sell_vol = compute_buy_ratio(pid, trades)
+        if ratio is None:
+            dbg(f"{pid} | insufficient trades (n={n}); skip.")
+            continue
 
+        dbg(f"{pid} | ratio={ratio:.4f} n={n} buy_vol={buy_vol} sell_vol={sell_vol}")
+        if best is None or (ratio > best[1]) or (ratio == best[1] and vol24 > best[3]):
+            best = (base, ratio, n, vol24)
+
+        # Be gentle with rate limits
+        time.sleep(0.05)
+
+    return (best[0], best[1], best[2]) if best else None
+
+# ---------------- Trading ----------------
 def place_market_buy(symbol: str, usd_amount: Decimal, portfolio_uuid: Optional[str]) -> None:
     pid = f"{symbol}-{QUOTE}"
     payload = {
@@ -240,12 +231,12 @@ def place_market_buy(symbol: str, usd_amount: Decimal, portfolio_uuid: Optional[
         payload["portfolio_id"] = portfolio_uuid
     try:
         resp = client.post("/api/v3/brokerage/orders", data=payload)
-        oid = (resp.get("order_id") or resp.get("orderId")
-               or (resp.get("success_response", {}) or {}).get("order_id"))
+        oid = (_get(resp, "order_id") or _get(resp, "orderId")
+               or _get(_get(resp, "success_response", {}) or {}, "order_id"))
         log(f"{pid} | BUY ${usd_amount} submitted (order {oid})")
     except Exception as e:
         log(f"{pid} | BUY failed: {type(e).__name__}: {e}")
-        sys.exit(1)
+        raise
 
 # ---------------- Main ----------------
 def main():
@@ -253,13 +244,25 @@ def main():
     if usd_amt <= 0:
         raise SystemExit("BUY_USD must be > 0")
 
-    log(f"Started | leaderboard={LEADERBOARD} | buy=${usd_amt} | quote={QUOTE}")
+    log(f"Started | buy=${usd_amt} | quote={QUOTE} | max_products={MAX_PRODUCTS} | trades_limit={TRADES_LIMIT} | min_trades={MIN_TRADES}")
     pf = ensure_portfolio_uuid()
 
-    sym = get_top_symbol()
-    if not sym:
-        log("No symbol found; aborting.")
-        sys.exit(1)
+    if TOP_OVERRIDE:
+        log(f"Using TOP_TICKER_OVERRIDE={TOP_OVERRIDE}")
+        sym = TOP_OVERRIDE
+    else:
+        products = fetch_usd_products()
+        if not products:
+            log("No USD products found; aborting.")
+            raise SystemExit(1)
+
+        choice = pick_top_by_ratio(products)
+        if not choice:
+            log("Could not determine a top symbol (not enough trades or API blocked); aborting.")
+            raise SystemExit(1)
+
+        sym, ratio, n = choice
+        log(f"Selected top ticker: {sym} (buy_ratio={ratio:.2%}, trades={n})")
 
     place_market_buy(sym, usd_amt, pf)
     log("Done.")
