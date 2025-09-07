@@ -4,10 +4,10 @@ Daily buy of the highest buy/sell ratio USD asset on Coinbase Advanced Trade.
 
 Approach:
   1) List tradable, online USD products (e.g., BTC-USD).
-  2) Prefilter to top-N by 24h volume (to avoid hammering every microcap).
-  3) For each candidate, fetch recent market trades and compute:
+  2) Prefilter to top-N by 24h volume (keeps API calls reasonable).
+  3) For each candidate, fetch recent public trades and compute:
         buy_ratio = sum(base_size on BUY trades) / sum(base_size on all trades)
-  4) Pick the highest buy_ratio (tie-break on 24h volume), then BUY $BUY_USD at market (IOC).
+  4) Pick the highest buy_ratio (tie-breaker: 24h volume), then BUY $BUY_USD (market IOC).
 
 Env:
   COINBASE_API_KEY=...
@@ -20,13 +20,12 @@ Env:
 
   # Universe controls:
   MAX_PRODUCTS=60                 # scan top-N by 24h volume
-  TRADES_LIMIT=250                # recent trades fetched per product (max recommended)
+  TRADES_LIMIT=250                # recent trades fetched per product
   MIN_TRADES=30                   # require at least this many trades to accept a ratio
   DENYLIST=USDC,USDT,EURT,WBTC    # skip these tickers (default excludes stables/wrapped)
-  ALLOWLIST=                      # if set (comma-separated tickers), only scan these
-  TOP_TICKER_OVERRIDE=            # e.g. BTC (bypass selection entirely)
+  ALLOWLIST=                      # if set, only pick from these tickers
+  TOP_TICKER_OVERRIDE=            # e.g., BTC (bypass selection entirely)
 
-  # Misc:
   DEBUG=1
 
 Requires:
@@ -52,7 +51,7 @@ TOP_OVERRIDE    = os.getenv("TOP_TICKER_OVERRIDE", "").strip().upper()
 DENYLIST        = {s.strip().upper() for s in os.getenv("DENYLIST", "USDC,USDT,EURT,WBTC").split(",") if s.strip()}
 ALLOWLIST_RAW   = os.getenv("ALLOWLIST", "").strip()
 ALLOWLIST       = {s.strip().upper() for s in ALLOWLIST_RAW.split(",") if s.strip()} if ALLOWLIST_RAW else set()
-DEBUG           = os.getenv("DEBUG", "0") not in ("0","false","False",""))
+DEBUG           = os.getenv("DEBUG", "0").lower() not in ("0", "false", "no", "off", "")
 
 client = RESTClient()  # uses COINBASE_API_KEY / COINBASE_API_SECRET
 
@@ -97,10 +96,7 @@ def ensure_portfolio_uuid() -> Optional[str]:
 
 # ---------------- Market universe ----------------
 def fetch_usd_products() -> List[dict]:
-    """
-    Get all market products and return those with USD quote,
-    that are online & tradable, honoring allow/deny lists.
-    """
+    """Get tradable online USD products, honoring allow/deny lists, sorted by 24h volume."""
     try:
         res = client.get("/api/v3/brokerage/market/products", params={"limit": 250})
         prods = _get(res, "products") or _get(res, "data") or _get(res, "list") or []
@@ -113,7 +109,7 @@ def fetch_usd_products() -> List[dict]:
     for p in prods:
         pid    = str(_get(p, "product_id") or "")
         quote  = str(_get(p, "quote_currency_id") or _get(p, "quote_currency") or "").upper()
-        base   = str(_get(p, "base_currency_id") or _get(p, "base_currency") or "").upper()
+        base   = str(_get(p, "base_currency_id")  or _get(p, "base_currency")  or "").upper()
         status = str(_get(p, "status") or _get(p, "status_message") or "online").lower()
         tradable = bool(_get(p, "is_tradable", True))
         if not pid or quote != QUOTE or not tradable or "offline" in status:
@@ -124,12 +120,12 @@ def fetch_usd_products() -> List[dict]:
             continue
         usd_products.append(p)
 
-    # Sort by 24h volume desc and keep top N to reduce API calls
     def dec(v) -> Decimal:
         try:
             return D(str(v))
         except Exception:
             return Decimal(0)
+
     usd_products.sort(key=lambda p: dec(_get(p, "volume_24h")), reverse=True)
     if MAX_PRODUCTS and len(usd_products) > MAX_PRODUCTS:
         usd_products = usd_products[:MAX_PRODUCTS]
@@ -139,29 +135,21 @@ def fetch_usd_products() -> List[dict]:
 
 # ---------------- Buy ratio (from trades) ----------------
 def get_trades(pid: str, limit: int) -> List[dict]:
-    """
-    Fetch recent market trades for a product.
-    Endpoint: /api/v3/brokerage/market/products/{pid}/trades
-    """
+    """Fetch recent public trades for a product."""
     try:
         res = client.get(f"/api/v3/brokerage/market/products/{pid}/trades", params={"limit": limit})
-        trades = _get(res, "trades") or _get(res, "data") or []
-        return trades
+        return _get(res, "trades") or _get(res, "data") or []
     except Exception as e:
         dbg(f"{pid} | trades fetch error: {e}")
         return []
 
 def compute_buy_ratio(pid: str, trades: List[dict]) -> Tuple[Optional[Decimal], int, Decimal, Decimal]:
-    """
-    Return (buy_ratio, n_trades, buy_vol, sell_vol)
-    buy_ratio in [0,1] based on base-size volume. None if insufficient trades.
-    """
+    """Return (buy_ratio [0..1], n_trades, buy_vol, sell_vol); None if insufficient trades."""
     buy_vol = Decimal(0)
     sell_vol = Decimal(0)
     n = 0
     for t in trades:
         side = str(_get(t, "side") or _get(t, "trade_side") or "").upper()
-        # Base size field may be "size" or "trade_size" or "base_size"
         raw_size = _get(t, "size") or _get(t, "base_size") or _get(t, "trade_size")
         try:
             sz = D(str(raw_size))
@@ -174,7 +162,6 @@ def compute_buy_ratio(pid: str, trades: List[dict]) -> Tuple[Optional[Decimal], 
         elif side == "SELL":
             sell_vol += sz
         else:
-            # Unknown side → skip
             continue
         n += 1
 
@@ -185,9 +172,8 @@ def compute_buy_ratio(pid: str, trades: List[dict]) -> Tuple[Optional[Decimal], 
 
 def pick_top_by_ratio(products: List[dict]) -> Optional[Tuple[str, Decimal, int]]:
     """
-    Iterate candidates, compute buy_ratio, pick the best.
-    Tie-breaker: 24h volume (descending).
-    Returns (symbol, buy_ratio, n_trades).
+    Compute ratio for each candidate, return (symbol, ratio, n_trades) for the best.
+    Tie-breaker: 24h volume (desc).
     """
     best: Optional[Tuple[str, Decimal, int, Decimal]] = None  # (base, ratio, n_trades, vol24h)
 
@@ -214,7 +200,7 @@ def pick_top_by_ratio(products: List[dict]) -> Optional[Tuple[str, Decimal, int]
         if best is None or (ratio > best[1]) or (ratio == best[1] and vol24 > best[3]):
             best = (base, ratio, n, vol24)
 
-        # Be gentle with rate limits
+        # small sleep to be gentle with rate limits
         time.sleep(0.05)
 
     return (best[0], best[1], best[2]) if best else None
