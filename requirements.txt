@@ -1,2 +1,2 @@
 coinbase-advanced-py>=1.6.3
-playwright>=1.46.0
+requests>=2.32.0
