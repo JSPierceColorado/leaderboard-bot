@@ -10,25 +10,30 @@ Flow
 3) For each candidate, fetch most recent public trades from the Exchange API:
      GET https://api.exchange.coinbase.com/products/{product_id}/trades?limit=100
 4) Compute buy_ratio = buy_base_volume / (buy + sell base volume).
-5) Pick the highest buy_ratio (tie-break by 24h volume) and place a $BUY_USD
-   market IOC via Advanced Trade, scoped to your portfolio via QUERY PARAM.
+5) Pick the highest buy_ratio (tie-break by 24h volume) and place a BUY using:
+   - If BUY_PCT > 0: percent of available quote balance (buying power)
+   - Else: fixed BUY_USD
+   Market IOC via Advanced Trade, scoped to your portfolio via QUERY PARAM.
 
 Env
 ---
 COINBASE_API_KEY=...
 COINBASE_API_SECRET=...
 
-BUY_USD=5
-QUOTE_CURRENCY=USD
-PORTFOLIO_UUID=<uuid>                # preferred (routes order to that portfolio)
-PORTFOLIO_NAME=bot                   # used only if UUID not set
+# Choose one:
+BUY_PCT=0.05                       # e.g., 0.05 = 5% of available quote balance
+BUY_USD=5                          # fallback if BUY_PCT<=0 or unset
 
-MAX_PRODUCTS=60                      # scan top-N by 24h volume
-TRADES_LIMIT=100                     # Exchange endpoint typical max ~100
-MIN_TRADES=30                        # minimum trades to accept ratio
-DENYLIST=USDC,USDT,EURT,WBTC         # skip these tickers by default
-ALLOWLIST=                            # if set, only pick from these tickers
-TOP_TICKER_OVERRIDE=                  # e.g., BTC (forces selection)
+QUOTE_CURRENCY=USD
+PORTFOLIO_UUID=<uuid>              # preferred (routes order to that portfolio)
+PORTFOLIO_NAME=bot                 # used only if UUID not set
+
+MAX_PRODUCTS=60                    # scan top-N by 24h volume
+TRADES_LIMIT=100                   # Exchange endpoint typical max ~100
+MIN_TRADES=30                      # minimum trades to accept ratio
+DENYLIST=USDC,USDT,EURT,WBTC       # skip these tickers by default
+ALLOWLIST=                          # if set, only pick from these tickers (comma-separated bases)
+TOP_TICKER_OVERRIDE=                # e.g., BTC (forces selection)
 DEBUG=1
 
 Requires
@@ -39,13 +44,14 @@ pip install coinbase-advanced-py>=1.6.3 requests>=2.32.0
 import os
 import time
 import uuid
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from coinbase.rest import RESTClient
 
 # ---------------- Config ----------------
+BUY_PCT_STR     = os.getenv("BUY_PCT", "").strip()
 BUY_USD_STR     = os.getenv("BUY_USD", "5").strip()
 QUOTE           = os.getenv("QUOTE_CURRENCY", "USD").upper().strip()
 PORTFOLIO_UUID  = os.getenv("PORTFOLIO_UUID", "").strip()
@@ -70,7 +76,7 @@ def dbg(msg: str) -> None:
         print(f"[cb-buyratio][debug] {msg}", flush=True)
 
 # ---------------- Helpers ----------------
-def D(x: str) -> Decimal:
+def D(x: str | Decimal | float | int) -> Decimal:
     try:
         return Decimal(str(x))
     except InvalidOperation:
@@ -99,6 +105,33 @@ def ensure_portfolio_uuid() -> Optional[str]:
     except Exception as e:
         log(f"Error listing portfolios: {e}")
     return None
+
+# --------- Increments / balances for correct notional sizing ----------
+def get_product_meta(pid: str) -> Dict[str, Decimal]:
+    p = client.get_product(product_id=pid)
+    # quote_min_size may be absent on some products; default to 0
+    qmin = getattr(p, "quote_min_size", None)
+    return {
+        "price_inc": D(getattr(p, "price_increment", "0")),
+        "base_inc":  D(getattr(p, "base_increment", "0")),
+        "quote_inc": D(getattr(p, "quote_increment", "0")),
+        "base_ccy":  getattr(p, "base_currency_id"),
+        "quote_ccy": getattr(p, "quote_currency_id"),
+        "quote_min": D(qmin) if qmin is not None else D("0"),
+    }
+
+def round_to_inc(value: Decimal, inc: Decimal) -> Decimal:
+    if inc is None or inc <= 0:
+        return value
+    return (value / inc).to_integral_value(rounding=ROUND_DOWN) * inc
+
+def get_quote_available(quote_ccy: str) -> Decimal:
+    accs = client.get_accounts()
+    for a in getattr(accs, "accounts", []):
+        if getattr(a, "currency", "").upper() == quote_ccy:
+            vb = a.available_balance
+            return D(vb["value"] if isinstance(vb, dict) else vb)
+    return D("0")
 
 # ---------------- Advanced Trade: products (paginated) ----------------
 def fetch_all_products() -> List[dict]:
@@ -242,7 +275,7 @@ def _make_order_payload(product_id: str, usd_amount: Decimal) -> dict:
     return {
         "product_id": product_id,
         "side": "BUY",
-        "client_order_id": str(uuid.uuid4()),  # ensure a valid UUIDv4
+        "client_order_id": str(uuid.uuid4()),  # valid UUIDv4
         "order_configuration": {
             "market_market_ioc": {"quote_size": f"{usd_amount.normalize():f}"}
         },
@@ -252,7 +285,6 @@ def place_market_buy(product_id: str, usd_amount: Decimal, portfolio_uuid: Optio
     """
     Submit a market IOC BUY using quote_size=$, scoped by portfolio via QUERY PARAM.
     NOTE: 'portfolio_id' must NOT be in the JSON body (it will 400).
-    Also explicitly provide a valid UUIDv4 client_order_id to avoid SDK auto-inject quirks.
     """
     params = {}
     if portfolio_uuid:
@@ -277,21 +309,20 @@ def place_market_buy(product_id: str, usd_amount: Decimal, portfolio_uuid: Optio
                    or _get(_get(resp, "success_response", {}) or {}, "order_id"))
             log(f"{product_id} | BUY ${usd_amount} submitted on retry (order {oid})")
             return
-        # otherwise re-raise
         log(f"{product_id} | BUY failed: {type(e).__name__}: {e}")
         raise
 
 # ---------------- Main ----------------
 def main():
-    usd_amt = D(BUY_USD_STR)
-    if usd_amt <= 0:
-        raise SystemExit("BUY_USD must be > 0")
+    # Decide sizing mode
+    buy_pct = D(BUY_PCT_STR) if BUY_PCT_STR else D("0")
+    usd_amt_fixed = D(BUY_USD_STR)
 
-    log(f"Started | buy=${usd_amt} | quote={QUOTE} | max_products={MAX_PRODUCTS} | trades_limit={TRADES_LIMIT} | min_trades={MIN_TRADES}")
+    log(f"Started | mode={'PCT' if buy_pct > 0 else 'USD'} | buy_pct={buy_pct} | buy_usd={usd_amt_fixed} | quote={QUOTE} | "
+        f"max_products={MAX_PRODUCTS} | trades_limit={TRADES_LIMIT} | min_trades={MIN_TRADES}")
     pf = ensure_portfolio_uuid()
 
     if TOP_OVERRIDE:
-        # allow forcing a symbol; resolve its product_id
         forced_pid = f"{TOP_OVERRIDE}-{QUOTE}"
         log(f"Using TOP_TICKER_OVERRIDE={TOP_OVERRIDE} -> {forced_pid}")
         choice = (TOP_OVERRIDE, forced_pid, Decimal("1"), 0)
@@ -308,6 +339,28 @@ def main():
 
     base, pid, ratio, n = choice
     log(f"Selected top: {base} via {pid} (buy_ratio={ratio:.2%}, trades={n})")
+
+    # Build notional based on mode (percent of buying power vs fixed)
+    meta = get_product_meta(pid)
+    quote_bal = get_quote_available(meta["quote_ccy"])
+    if buy_pct > 0:
+        usd_amt = round_to_inc(quote_bal * buy_pct, meta["quote_inc"])
+        if usd_amt <= 0:
+            log(f"{pid} | Computed notional rounds to 0 (quote_bal={quote_bal}, pct={buy_pct}); aborting.")
+            raise SystemExit(1)
+        if meta["quote_min"] and usd_amt < meta["quote_min"]:
+            log(f"{pid} | Notional {usd_amt} < quote_min {meta['quote_min']}; aborting.")
+            raise SystemExit(1)
+        log(f"{pid} | quote_bal={quote_bal} {meta['quote_ccy']} | pct={buy_pct} -> buy_notional=${usd_amt}")
+    else:
+        usd_amt = D(usd_amt_fixed)
+        if usd_amt <= 0:
+            raise SystemExit("BUY_USD must be > 0")
+        usd_amt = round_to_inc(usd_amt, meta["quote_inc"])
+        if meta["quote_min"] and usd_amt < meta["quote_min"]:
+            log(f"{pid} | Notional {usd_amt} < quote_min {meta['quote_min']}; aborting.")
+            raise SystemExit(1)
+        log(f"{pid} | fixed buy_notional=${usd_amt}")
 
     place_market_buy(pid, usd_amt, pf)
     log("Done.")
