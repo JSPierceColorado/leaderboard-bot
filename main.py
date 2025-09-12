@@ -9,6 +9,7 @@ Flow
 2) Keep top-N by 24h volume (reduces API calls).
 3) For each candidate, fetch most recent public trades from the Exchange API:
      GET https://api.exchange.coinbase.com/products/{product_id}/trades?limit=100
+   (Now paginated with `before=<trade_id>` to gather up to TRADES_LIMIT trades.)
 4) Compute buy_ratio = buy_base_volume / (buy + sell base volume).
 5) Pick the highest buy_ratio (tie-break by 24h volume) and place a BUY using:
    - If BUY_PCT > 0: percent of available quote balance (buying power)
@@ -29,7 +30,7 @@ PORTFOLIO_UUID=<uuid>              # preferred (routes order to that portfolio)
 PORTFOLIO_NAME=bot                 # used only if UUID not set
 
 MAX_PRODUCTS=60                    # scan top-N by 24h volume
-TRADES_LIMIT=100                   # Exchange endpoint typical max ~100
+TRADES_LIMIT=1000                  # total recent trades to consider per product (will paginate)
 MIN_TRADES=30                      # minimum trades to accept ratio
 DENYLIST=USDC,USDT,EURT,WBTC       # skip these tickers by default
 ALLOWLIST=                          # if set, only pick from these tickers (comma-separated bases)
@@ -186,28 +187,50 @@ def fetch_usd_products() -> List[dict]:
     dbg(f"USD products considered: {len(usd_products)} (top by 24h volume)")
     return usd_products
 
-# ---------------- Exchange public API: trades ----------------
+# ---------------- Exchange public API: trades (paginated) ----------------
 EXCHANGE_BASE = "https://api.exchange.coinbase.com"
+EXCHANGE_TRADES_MAX = 100  # per-request cap
 
-def get_trades_exchange(pid: str, limit: int) -> List[dict]:
+def get_trades_exchange(pid: str, total_limit: int) -> List[dict]:
     """
-    Fetch recent public trades from Coinbase Exchange market data API.
-    Example: GET https://api.exchange.coinbase.com/products/BTC-USD/trades?limit=100
+    Fetch up to `total_limit` recent public trades from Coinbase Exchange Market Data API.
+    Uses backward pagination with `before=<trade_id>` (newest-first).
+    Example page:
+      GET /products/BTC-USD/trades?limit=100
+      GET /products/BTC-USD/trades?limit=100&before=<last_trade_id_from_previous_page>
     """
     url = f"{EXCHANGE_BASE}/products/{pid}/trades"
-    headers = {
-        "User-Agent": "cb-buyratio-bot/1.0",
-        "Accept": "application/json",
-    }
-    params = {"limit": max(1, min(limit, 100))}
-    try:
-        r = requests.get(url, headers=headers, params=params, timeout=20)
-        r.raise_for_status()
-        data = r.json()
-        return data if isinstance(data, list) else []
-    except Exception as e:
-        dbg(f"{pid} | exchange trades fetch error: {e}")
-        return []
+    headers = {"User-Agent": "cb-buyratio-bot/1.0", "Accept": "application/json"}
+
+    out: List[dict] = []
+    before: Optional[int] = None
+    remaining = max(1, int(total_limit))
+
+    while remaining > 0:
+        page_limit = min(remaining, EXCHANGE_TRADES_MAX)
+        params = {"limit": page_limit}
+        if before is not None:
+            params["before"] = before
+        try:
+            r = requests.get(url, headers=headers, params=params, timeout=20)
+            r.raise_for_status()
+            data = r.json()
+            items = data if isinstance(data, list) else []
+            if not items:
+                break
+            out.extend(items)
+            remaining -= len(items)
+            # last item is the oldest in this page; page backwards using its trade_id
+            last = items[-1]
+            before = last.get("trade_id") or last.get("tradeId")
+            if before is None or len(items) < page_limit:
+                break
+            time.sleep(0.05)  # gentle on rate limits
+        except Exception as e:
+            dbg(f"{pid} | exchange trades fetch error: {e}")
+            break
+
+    return out
 
 def compute_buy_ratio_from_trades(trades: List[dict]) -> Tuple[Optional[Decimal], int, Decimal, Decimal]:
     """Return (buy_ratio [0..1], n_trades, buy_vol, sell_vol); None if insufficient trades."""
@@ -266,7 +289,7 @@ def pick_top_by_ratio(products: List[dict]) -> Optional[Tuple[str, str, Decimal,
         if best is None or (ratio > best[2]) or (ratio == best[2] and vol24 > best[4]):
             best = (base, pid, ratio, n, vol24)
 
-        time.sleep(0.05)  # gentle on rate limits
+        time.sleep(0.05)  # gentle on rate limits across products
 
     return (best[0], best[1], best[2], best[3]) if best else None
 
@@ -318,8 +341,9 @@ def main():
     buy_pct = D(BUY_PCT_STR) if BUY_PCT_STR else D("0")
     usd_amt_fixed = D(BUY_USD_STR)
 
+    eff_per_req = 100  # Exchange per-request max
     log(f"Started | mode={'PCT' if buy_pct > 0 else 'USD'} | buy_pct={buy_pct} | buy_usd={usd_amt_fixed} | quote={QUOTE} | "
-        f"max_products={MAX_PRODUCTS} | trades_limit={TRADES_LIMIT} | min_trades={MIN_TRADES}")
+        f"max_products={MAX_PRODUCTS} | trades_limit_req={TRADES_LIMIT} | trades_limit_eff_per_req={eff_per_req} | min_trades={MIN_TRADES}")
     pf = ensure_portfolio_uuid()
 
     if TOP_OVERRIDE:
