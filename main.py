@@ -1,30 +1,41 @@
 #!/usr/bin/env python3
 """
-Signal scanner & buyer for Coinbase USD markets.
+Perpetual 15m-bar scanner & buyer for ALL Coinbase USD markets.
 
 Rule (15m timeframe):
 - RSI(14) <= 30
 - SMA(60) < SMA(240)
 
 Action:
-- Market IOC buy using 5% of CURRENT available USD (or BUY_PCT env).
-- Runs across all tradable USD products (honors allow/deny lists and MAX_PRODUCTS).
-- Uses Coinbase Exchange public candles; places orders via Advanced Trade.
+- Market IOC buy using 5% of CURRENT available USD per qualifying asset.
+- No caps/limits on number of products scanned or buys.
+
+Behavior:
+- Runs forever. Aligns to the close of each 15m bar (00, 15, 30, 45 past the hour).
+- Scans all USD-quoted products (no MAX cap).
+- Intentionally allows repeat buys whenever the signal is met (no per-bar de-dupe).
 
 Env
 ---
 COINBASE_API_KEY=...
 COINBASE_API_SECRET=...
 
-BUY_PCT=0.05                       # default 5% of available USD per qualifying asset
+BUY_PCT=0.05                       # 5% of available USD per qualifying asset
 BUY_USD=0                          # ignored if BUY_PCT>0
 QUOTE_CURRENCY=USD
 PORTFOLIO_UUID=<uuid>              # preferred (routes order to that portfolio)
 PORTFOLIO_NAME=bot                 # used only if UUID not set
 
-MAX_PRODUCTS=60                    # 0 = no cap (scan all)
-DENYLIST=USDC,USDT,EURT,WBTC
+# No cap by default:
+MAX_PRODUCTS=0                     # 0 = scan ALL USD products (no limit)
+
+# Lists are optional; defaults let you scan everything:
+DENYLIST=
 ALLOWLIST=
+
+# How often to refresh product list (seconds):
+PRODUCT_REFRESH_SECS=3600
+
 DEBUG=1
 
 Requires
@@ -42,27 +53,27 @@ import requests
 from coinbase.rest import RESTClient
 
 # ---------------- Config ----------------
-BUY_PCT_STR     = os.getenv("BUY_PCT", "0.05").strip()  # default 5%
+BUY_PCT_STR     = os.getenv("BUY_PCT", "0.05").strip()
 BUY_USD_STR     = os.getenv("BUY_USD", "0").strip()
 QUOTE           = os.getenv("QUOTE_CURRENCY", "USD").upper().strip()
 PORTFOLIO_UUID  = os.getenv("PORTFOLIO_UUID", "").strip()
 PORTFOLIO_NAME  = os.getenv("PORTFOLIO_NAME", "bot").strip() if not PORTFOLIO_UUID else ""
-MAX_PRODUCTS    = int(os.getenv("MAX_PRODUCTS", "60"))
-TOP_OVERRIDE    = os.getenv("TOP_TICKER_OVERRIDE", "").strip().upper()  # unused, but kept for compatibility
-DENYLIST        = {s.strip().upper() for s in os.getenv("DENYLIST", "USDC,USDT,EURT,WBTC").split(",") if s.strip()}
+MAX_PRODUCTS    = int(os.getenv("MAX_PRODUCTS", "0"))  # 0 = no cap
+DENYLIST        = {s.strip().upper() for s in os.getenv("DENYLIST", "").split(",") if s.strip()}
 ALLOWLIST_RAW   = os.getenv("ALLOWLIST", "").strip()
 ALLOWLIST       = {s.strip().upper() for s in ALLOWLIST_RAW.split(",") if s.strip()} if ALLOWLIST_RAW else set()
+PRODUCT_REFRESH_SECS = int(os.getenv("PRODUCT_REFRESH_SECS", "3600"))
 DEBUG           = os.getenv("DEBUG", "0").lower() not in ("0", "false", "no", "off", "")
 
 client = RESTClient()  # uses COINBASE_API_KEY / COINBASE_API_SECRET
 
 # ---------------- Logging ----------------
 def log(msg: str) -> None:
-    print(f"[cb-rsi-buyer] {msg}", flush=True)
+    print(f"[cb-rsi-buyer-live] {msg}", flush=True)
 
 def dbg(msg: str) -> None:
     if DEBUG:
-        print(f"[cb-rsi-buyer][debug] {msg}", flush=True)
+        print(f"[cb-rsi-buyer-live][debug] {msg}", flush=True)
 
 # ---------------- Helpers ----------------
 def D(x: str | Decimal | float | int) -> Decimal:
@@ -138,7 +149,7 @@ def fetch_all_products() -> List[dict]:
     return items
 
 def fetch_usd_products() -> List[dict]:
-    """Get tradable online USD products, honoring allow/deny lists, sorted by 24h volume."""
+    """Get tradable online USD products (optionally honor allow/deny lists), sorted by 24h volume."""
     try:
         prods = fetch_all_products()
     except Exception:
@@ -167,10 +178,10 @@ def fetch_usd_products() -> List[dict]:
             return Decimal(0)
 
     usd_products.sort(key=lambda p: dec(_get(p, "volume_24h")), reverse=True)
-    if MAX_PRODUCTS and len(usd_products) > MAX_PRODUCTS:
+    if MAX_PRODUCTS and MAX_PRODUCTS > 0 and len(usd_products) > MAX_PRODUCTS:
         usd_products = usd_products[:MAX_PRODUCTS]
 
-    dbg(f"USD products considered: {len(usd_products)} (top by 24h volume; MAX_PRODUCTS={MAX_PRODUCTS})")
+    dbg(f"USD products considered: {len(usd_products)}")
     return usd_products
 
 # ---------------- Exchange public API: 15m candles ----------------
@@ -180,26 +191,19 @@ def get_candles_15m(pid: str, bars_needed: int = 300) -> List[Tuple[int, float, 
     """
     Return recent 15m candles for product_id, oldest -> newest.
     Each item: (time, low, high, open, close, volume)
-    Coinbase Exchange candles are returned newest-first; we reverse.
     """
-    granularity = 900  # 15 minutes in seconds
+    granularity = 900  # 15 minutes
     now = int(time.time())
-    # Pull a window large enough for 240 SMA + RSI seed
     window_secs = granularity * max(bars_needed, 300)
-    params = {
-        "granularity": granularity,
-        "start": now - window_secs,
-        "end": now
-    }
+    params = {"granularity": granularity, "start": now - window_secs, "end": now}
     url = f"{EXCHANGE_BASE}/products/{pid}/candles"
-    headers = {"User-Agent": "cb-rsi-buyer/1.0", "Accept": "application/json"}
+    headers = {"User-Agent": "cb-rsi-buyer-live/1.0", "Accept": "application/json"}
     try:
         r = requests.get(url, headers=headers, params=params, timeout=20)
         r.raise_for_status()
         data = r.json()
         if not isinstance(data, list):
             return []
-        # data: [ [time, low, high, open, close, volume], ... ] newest first
         data.sort(key=lambda x: x[0])  # oldest first
         return [(int(t), float(lo), float(hi), float(op), float(cl), float(v)) for t, lo, hi, op, cl, v in data]
     except Exception as e:
@@ -210,32 +214,26 @@ def get_candles_15m(pid: str, bars_needed: int = 300) -> List[Tuple[int, float, 
 def sma(values: List[float], length: int) -> Optional[float]:
     if len(values) < length:
         return None
-    s = sum(values[-length:])
-    return s / float(length)
+    return sum(values[-length:]) / float(length)
 
 def rsi_wilder_14(closes: List[float], length: int = 14) -> Optional[float]:
-    """
-    Wilder's RSI(14) computed on closes; returns latest RSI value.
-    Requires at least (length + 1) closes.
-    """
+    """Wilder's RSI(14) on closes; returns latest RSI value."""
     if len(closes) < length + 1:
         return None
     gains: List[float] = []
     losses: List[float] = []
-    # Initial averages
     for i in range(1, length + 1):
         diff = closes[i] - closes[i - 1]
         gains.append(max(diff, 0.0))
         losses.append(max(-diff, 0.0))
     avg_gain = sum(gains) / length
     avg_loss = sum(losses) / length
-    # Wilder smoothing over the rest
     for i in range(length + 1, len(closes)):
         diff = closes[i] - closes[i - 1]
         gain = max(diff, 0.0)
         loss = max(-diff, 0.0)
         avg_gain = (avg_gain * (length - 1) + gain) / length
-        avg_loss = (avg_loss * (length - 1) + loss) / length
+    avg_loss = (avg_loss * (length - 1) + loss) / length
     if avg_loss == 0:
         return 100.0
     rs = avg_gain / avg_loss
@@ -275,72 +273,100 @@ def place_market_buy(product_id: str, usd_amount: Decimal, portfolio_uuid: Optio
         log(f"{product_id} | BUY failed: {type(e).__name__}: {e}")
         raise
 
-# ---------------- Main ----------------
+# ---------------- Scheduling: align to 15m bars ----------------
+FIFTEEN_MIN = 900
+
+def next_bar_epoch(now: Optional[int] = None) -> int:
+    """Return the UNIX epoch for the *next* 15m bar boundary."""
+    if now is None:
+        now = int(time.time())
+    return ((now // FIFTEEN_MIN) + 1) * FIFTEEN_MIN
+
+def sleep_until(ts: int, pad_seconds: int = 3) -> None:
+    """Sleep until ts + small pad (to let the exchange finalize the bar)."""
+    delay = ts - int(time.time()) + pad_seconds
+    if delay > 0:
+        time.sleep(delay)
+
+# ---------------- Main perpetual loop ----------------
 def main():
     buy_pct = D(BUY_PCT_STR) if BUY_PCT_STR else D("0.05")
-    usd_amt_fixed = D(BUY_USD_STR)
+    usd_amt_fixed = D(BUY_USD_STR)  # ignored if buy_pct > 0
 
-    log(f"Started scan | mode={'PCT' if buy_pct > 0 else 'USD'} | buy_pct={buy_pct} | quote={QUOTE} | MAX_PRODUCTS={MAX_PRODUCTS}")
+    log(f"Started LIVE | mode={'PCT' if buy_pct > 0 else 'USD'} | buy_pct={buy_pct} | quote={QUOTE} | no caps/limits")
     pf = ensure_portfolio_uuid()
 
-    products = fetch_usd_products()
-    if not products:
-        log("No USD products found; aborting.")
-        raise SystemExit(1)
+    products: List[dict] = []
+    products_last_refresh = 0
 
-    total_signals = 0
-    total_buys = 0
+    while True:
+        # refresh USD products if needed
+        now = int(time.time())
+        if not products or (now - products_last_refresh) >= PRODUCT_REFRESH_SECS:
+            products = fetch_usd_products()
+            products_last_refresh = now
+            log(f"Products refreshed: {len(products)} USD markets")
 
-    for p in products:
-        pid  = str(_get(p, "product_id") or "")
-        base = str(_get(p, "base_currency_id") or _get(p, "base_currency") or "").upper()
-        if not pid or not base:
-            continue
+        # Wait for the next bar boundary
+        boundary = next_bar_epoch(now)
+        sleep_until(boundary, pad_seconds=5)
 
-        candles = get_candles_15m(pid, bars_needed=300)
-        if len(candles) < 240 + 14 + 1:
-            dbg(f"{pid} | not enough candles ({len(candles)}) for SMA240 & RSI14; skip.")
-            continue
+        cycle_start = int(time.time())
+        total_signals = 0
+        total_buys = 0
 
-        closes = [c[4] for c in candles]  # close prices, oldest->newest
-        rsi14 = rsi_wilder_14(closes, 14)
-        sma60 = sma(closes, 60)
-        sma240 = sma(closes, 240)
-        if rsi14 is None or sma60 is None or sma240 is None:
-            continue
+        for p in products:
+            pid  = str(_get(p, "product_id") or "")
+            base = str(_get(p, "base_currency_id") or _get(p, "base_currency") or "").upper()
+            if not pid or not base:
+                continue
 
-        cond = (rsi14 <= 30.0) and (sma60 < sma240)
-        dbg(f"{pid} | RSI14={rsi14:.2f} SMA60={sma60:.6f} SMA240={sma240:.6f} -> signal={cond}")
-        if not cond:
-            continue
+            candles = get_candles_15m(pid, bars_needed=300)
+            if len(candles) < 240 + 14 + 1:
+                dbg(f"{pid} | insufficient candles ({len(candles)})")
+                continue
 
-        total_signals += 1
-        # Sizing per qualifying asset: 5% of *current* available USD (or fixed)
-        meta = get_product_meta(pid)
-        quote_bal = get_quote_available(meta["quote_ccy"])
-        if buy_pct > 0:
-            usd_amt = round_to_inc(quote_bal * buy_pct, meta["quote_inc"])
-        else:
-            usd_amt = round_to_inc(D(max(usd_amt_fixed, D("0"))), meta["quote_inc"])
+            closes = [c[4] for c in candles]
 
-        if usd_amt <= 0:
-            log(f"{pid} | Computed notional rounds to 0 (quote_bal={quote_bal}, pct={buy_pct}); skipping.")
-            continue
-        if meta["quote_min"] and usd_amt < meta["quote_min"]:
-            log(f"{pid} | Notional {usd_amt} < quote_min {meta['quote_min']}; skipping.")
-            continue
+            rsi14 = rsi_wilder_14(closes, 14)
+            sma60 = sma(closes, 60)
+            sma240 = sma(closes, 240)
+            if rsi14 is None or sma60 is None or sma240 is None:
+                continue
 
-        log(f"{pid} | SIGNAL ✅ | RSI14={rsi14:.2f} <= 30 and SMA60<SMA240 | buy_notional=${usd_amt}")
-        try:
-            place_market_buy(pid, usd_amt, pf)
-            total_buys += 1
-        except Exception:
-            # already logged in place_market_buy
-            pass
+            cond = (rsi14 <= 30.0) and (sma60 < sma240)
+            dbg(f"{pid} | RSI14={rsi14:.2f} SMA60={sma60:.6f} SMA240={sma240:.6f} -> signal={cond}")
+            if not cond:
+                continue
 
-        time.sleep(0.1)  # gentle pacing
+            total_signals += 1
 
-    log(f"Scan complete | signals={total_signals} | buys={total_buys}")
+            # Size: 5% of *current* available USD per qualifying asset (no global caps)
+            meta = get_product_meta(pid)
+            quote_bal = get_quote_available(meta["quote_ccy"])
+            if buy_pct > 0:
+                usd_amt = round_to_inc(quote_bal * buy_pct, meta["quote_inc"])
+            else:
+                usd_amt = round_to_inc(D(max(usd_amt_fixed, D("0"))), meta["quote_inc"])
+
+            if usd_amt <= 0:
+                log(f"{pid} | Notional rounds to 0 (quote_bal={quote_bal}, pct={buy_pct}); skipping.")
+                continue
+            if meta["quote_min"] and usd_amt < meta["quote_min"]:
+                log(f"{pid} | Notional {usd_amt} < quote_min {meta['quote_min']}; skipping.")
+                continue
+
+            log(f"{pid} | SIGNAL ✅ | RSI14={rsi14:.2f} <= 30 and SMA60<SMA240 | buy_notional=${usd_amt}")
+            try:
+                place_market_buy(pid, usd_amt, pf)
+                total_buys += 1
+            except Exception:
+                pass
+
+            time.sleep(0.05)  # gentle pacing
+
+        took = int(time.time()) - cycle_start
+        log(f"Bar complete | signals={total_signals} | buys={total_buys} | cycle_time={took}s")
 
 if __name__ == "__main__":
     main()
