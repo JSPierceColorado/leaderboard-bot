@@ -1,40 +1,30 @@
 #!/usr/bin/env python3
 """
-Daily buy of the highest buy/sell ratio USD asset on Coinbase.
+Signal scanner & buyer for Coinbase USD markets.
 
-Flow
-----
-1) List tradable USD products from Advanced Trade (paginated):
-     GET /api/v3/brokerage/products
-2) Keep top-N by 24h volume (reduces API calls).
-3) For each candidate, fetch most recent public trades from the Exchange API:
-     GET https://api.exchange.coinbase.com/products/{product_id}/trades?limit=100
-   (Now paginated with `before=<trade_id>` to gather up to TRADES_LIMIT trades.)
-4) Compute buy_ratio = buy_base_volume / (buy + sell base volume).
-5) Pick the highest buy_ratio (tie-break by 24h volume) and place a BUY using:
-   - If BUY_PCT > 0: percent of available quote balance (buying power)
-   - Else: fixed BUY_USD
-   Market IOC via Advanced Trade, scoped to your portfolio via QUERY PARAM.
+Rule (15m timeframe):
+- RSI(14) <= 30
+- SMA(60) < SMA(240)
+
+Action:
+- Market IOC buy using 5% of CURRENT available USD (or BUY_PCT env).
+- Runs across all tradable USD products (honors allow/deny lists and MAX_PRODUCTS).
+- Uses Coinbase Exchange public candles; places orders via Advanced Trade.
 
 Env
 ---
 COINBASE_API_KEY=...
 COINBASE_API_SECRET=...
 
-# Choose one:
-BUY_PCT=0.05                       # e.g., 0.05 = 5% of available quote balance
-BUY_USD=5                          # fallback if BUY_PCT<=0 or unset
-
+BUY_PCT=0.05                       # default 5% of available USD per qualifying asset
+BUY_USD=0                          # ignored if BUY_PCT>0
 QUOTE_CURRENCY=USD
 PORTFOLIO_UUID=<uuid>              # preferred (routes order to that portfolio)
 PORTFOLIO_NAME=bot                 # used only if UUID not set
 
-MAX_PRODUCTS=60                    # scan top-N by 24h volume
-TRADES_LIMIT=1000                  # total recent trades to consider per product (will paginate)
-MIN_TRADES=30                      # minimum trades to accept ratio
-DENYLIST=USDC,USDT,EURT,WBTC       # skip these tickers by default
-ALLOWLIST=                          # if set, only pick from these tickers (comma-separated bases)
-TOP_TICKER_OVERRIDE=                # e.g., BTC (forces selection)
+MAX_PRODUCTS=60                    # 0 = no cap (scan all)
+DENYLIST=USDC,USDT,EURT,WBTC
+ALLOWLIST=
 DEBUG=1
 
 Requires
@@ -52,15 +42,13 @@ import requests
 from coinbase.rest import RESTClient
 
 # ---------------- Config ----------------
-BUY_PCT_STR     = os.getenv("BUY_PCT", "").strip()
-BUY_USD_STR     = os.getenv("BUY_USD", "5").strip()
+BUY_PCT_STR     = os.getenv("BUY_PCT", "0.05").strip()  # default 5%
+BUY_USD_STR     = os.getenv("BUY_USD", "0").strip()
 QUOTE           = os.getenv("QUOTE_CURRENCY", "USD").upper().strip()
 PORTFOLIO_UUID  = os.getenv("PORTFOLIO_UUID", "").strip()
 PORTFOLIO_NAME  = os.getenv("PORTFOLIO_NAME", "bot").strip() if not PORTFOLIO_UUID else ""
 MAX_PRODUCTS    = int(os.getenv("MAX_PRODUCTS", "60"))
-TRADES_LIMIT    = int(os.getenv("TRADES_LIMIT", "100"))
-MIN_TRADES      = int(os.getenv("MIN_TRADES", "30"))
-TOP_OVERRIDE    = os.getenv("TOP_TICKER_OVERRIDE", "").strip().upper()
+TOP_OVERRIDE    = os.getenv("TOP_TICKER_OVERRIDE", "").strip().upper()  # unused, but kept for compatibility
 DENYLIST        = {s.strip().upper() for s in os.getenv("DENYLIST", "USDC,USDT,EURT,WBTC").split(",") if s.strip()}
 ALLOWLIST_RAW   = os.getenv("ALLOWLIST", "").strip()
 ALLOWLIST       = {s.strip().upper() for s in ALLOWLIST_RAW.split(",") if s.strip()} if ALLOWLIST_RAW else set()
@@ -70,11 +58,11 @@ client = RESTClient()  # uses COINBASE_API_KEY / COINBASE_API_SECRET
 
 # ---------------- Logging ----------------
 def log(msg: str) -> None:
-    print(f"[cb-buyratio] {msg}", flush=True)
+    print(f"[cb-rsi-buyer] {msg}", flush=True)
 
 def dbg(msg: str) -> None:
     if DEBUG:
-        print(f"[cb-buyratio][debug] {msg}", flush=True)
+        print(f"[cb-rsi-buyer][debug] {msg}", flush=True)
 
 # ---------------- Helpers ----------------
 def D(x: str | Decimal | float | int) -> Decimal:
@@ -110,7 +98,6 @@ def ensure_portfolio_uuid() -> Optional[str]:
 # --------- Increments / balances for correct notional sizing ----------
 def get_product_meta(pid: str) -> Dict[str, Decimal]:
     p = client.get_product(product_id=pid)
-    # quote_min_size may be absent on some products; default to 0
     qmin = getattr(p, "quote_min_size", None)
     return {
         "price_inc": D(getattr(p, "price_increment", "0")),
@@ -155,7 +142,6 @@ def fetch_usd_products() -> List[dict]:
     try:
         prods = fetch_all_products()
     except Exception:
-        # Fallback to SDK helper if needed
         res = client.get_products()
         prods = _get(res, "products") or _get(res, "data") or res
 
@@ -184,145 +170,99 @@ def fetch_usd_products() -> List[dict]:
     if MAX_PRODUCTS and len(usd_products) > MAX_PRODUCTS:
         usd_products = usd_products[:MAX_PRODUCTS]
 
-    dbg(f"USD products considered: {len(usd_products)} (top by 24h volume)")
+    dbg(f"USD products considered: {len(usd_products)} (top by 24h volume; MAX_PRODUCTS={MAX_PRODUCTS})")
     return usd_products
 
-# ---------------- Exchange public API: trades (paginated) ----------------
+# ---------------- Exchange public API: 15m candles ----------------
 EXCHANGE_BASE = "https://api.exchange.coinbase.com"
-EXCHANGE_TRADES_MAX = 100  # per-request cap
 
-def get_trades_exchange(pid: str, total_limit: int) -> List[dict]:
+def get_candles_15m(pid: str, bars_needed: int = 300) -> List[Tuple[int, float, float, float, float, float]]:
     """
-    Fetch up to `total_limit` recent public trades from Coinbase Exchange Market Data API.
-    Uses backward pagination with `before=<trade_id>` (newest-first).
-    Example page:
-      GET /products/BTC-USD/trades?limit=100
-      GET /products/BTC-USD/trades?limit=100&before=<last_trade_id_from_previous_page>
+    Return recent 15m candles for product_id, oldest -> newest.
+    Each item: (time, low, high, open, close, volume)
+    Coinbase Exchange candles are returned newest-first; we reverse.
     """
-    url = f"{EXCHANGE_BASE}/products/{pid}/trades"
-    headers = {"User-Agent": "cb-buyratio-bot/1.0", "Accept": "application/json"}
+    granularity = 900  # 15 minutes in seconds
+    now = int(time.time())
+    # Pull a window large enough for 240 SMA + RSI seed
+    window_secs = granularity * max(bars_needed, 300)
+    params = {
+        "granularity": granularity,
+        "start": now - window_secs,
+        "end": now
+    }
+    url = f"{EXCHANGE_BASE}/products/{pid}/candles"
+    headers = {"User-Agent": "cb-rsi-buyer/1.0", "Accept": "application/json"}
+    try:
+        r = requests.get(url, headers=headers, params=params, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        if not isinstance(data, list):
+            return []
+        # data: [ [time, low, high, open, close, volume], ... ] newest first
+        data.sort(key=lambda x: x[0])  # oldest first
+        return [(int(t), float(lo), float(hi), float(op), float(cl), float(v)) for t, lo, hi, op, cl, v in data]
+    except Exception as e:
+        dbg(f"{pid} | candles fetch error: {e}")
+        return []
 
-    out: List[dict] = []
-    before: Optional[int] = None
-    remaining = max(1, int(total_limit))
+# ---------------- Indicators (RSI, SMA) ----------------
+def sma(values: List[float], length: int) -> Optional[float]:
+    if len(values) < length:
+        return None
+    s = sum(values[-length:])
+    return s / float(length)
 
-    while remaining > 0:
-        page_limit = min(remaining, EXCHANGE_TRADES_MAX)
-        params = {"limit": page_limit}
-        if before is not None:
-            params["before"] = before
-        try:
-            r = requests.get(url, headers=headers, params=params, timeout=20)
-            r.raise_for_status()
-            data = r.json()
-            items = data if isinstance(data, list) else []
-            if not items:
-                break
-            out.extend(items)
-            remaining -= len(items)
-            # last item is the oldest in this page; page backwards using its trade_id
-            last = items[-1]
-            before = last.get("trade_id") or last.get("tradeId")
-            if before is None or len(items) < page_limit:
-                break
-            time.sleep(0.05)  # gentle on rate limits
-        except Exception as e:
-            dbg(f"{pid} | exchange trades fetch error: {e}")
-            break
-
-    return out
-
-def compute_buy_ratio_from_trades(trades: List[dict]) -> Tuple[Optional[Decimal], int, Decimal, Decimal]:
-    """Return (buy_ratio [0..1], n_trades, buy_vol, sell_vol); None if insufficient trades."""
-    buy_vol = Decimal(0)
-    sell_vol = Decimal(0)
-    n = 0
-    for t in trades:
-        side = str(_get(t, "side") or "").lower()   # 'buy' / 'sell'
-        raw_size = _get(t, "size") or _get(t, "base_size")
-        try:
-            sz = D(str(raw_size))
-        except Exception:
-            continue
-        if sz <= 0:
-            continue
-        if side == "buy":
-            buy_vol += sz
-            n += 1
-        elif side == "sell":
-            sell_vol += sz
-            n += 1
-
-    total = buy_vol + sell_vol
-    if n < MIN_TRADES or total <= 0:
-        return (None, n, buy_vol, sell_vol)
-    return (buy_vol / total, n, buy_vol, sell_vol)
-
-def pick_top_by_ratio(products: List[dict]) -> Optional[Tuple[str, str, Decimal, int]]:
+def rsi_wilder_14(closes: List[float], length: int = 14) -> Optional[float]:
     """
-    Compute ratio for each candidate using Exchange trades.
-    Returns (base_symbol, product_id, ratio, n_trades) for the best.
-    Tie-breaker: 24h volume (desc).
+    Wilder's RSI(14) computed on closes; returns latest RSI value.
+    Requires at least (length + 1) closes.
     """
-    best: Optional[Tuple[str, str, Decimal, int, Decimal]] = None  # (base, pid, ratio, n_trades, vol24h)
-
-    def dec(v) -> Decimal:
-        try:
-            return D(str(v))
-        except Exception:
-            return Decimal(0)
-
-    for p in products:
-        pid  = str(_get(p, "product_id") or "")
-        base = str(_get(p, "base_currency_id") or _get(p, "base_currency") or "").upper()
-        vol24= dec(_get(p, "volume_24h"))
-        if not pid or not base:
-            continue
-
-        trades = get_trades_exchange(pid, TRADES_LIMIT)
-        ratio, n, buy_vol, sell_vol = compute_buy_ratio_from_trades(trades)
-        if ratio is None:
-            dbg(f"{pid} | insufficient trades (n={n}); skip.")
-            continue
-
-        dbg(f"{pid} | ratio={ratio:.4f} n={n} buy_vol={buy_vol} sell_vol={sell_vol}")
-        if best is None or (ratio > best[2]) or (ratio == best[2] and vol24 > best[4]):
-            best = (base, pid, ratio, n, vol24)
-
-        time.sleep(0.05)  # gentle on rate limits across products
-
-    return (best[0], best[1], best[2], best[3]) if best else None
+    if len(closes) < length + 1:
+        return None
+    gains: List[float] = []
+    losses: List[float] = []
+    # Initial averages
+    for i in range(1, length + 1):
+        diff = closes[i] - closes[i - 1]
+        gains.append(max(diff, 0.0))
+        losses.append(max(-diff, 0.0))
+    avg_gain = sum(gains) / length
+    avg_loss = sum(losses) / length
+    # Wilder smoothing over the rest
+    for i in range(length + 1, len(closes)):
+        diff = closes[i] - closes[i - 1]
+        gain = max(diff, 0.0)
+        loss = max(-diff, 0.0)
+        avg_gain = (avg_gain * (length - 1) + gain) / length
+        avg_loss = (avg_loss * (length - 1) + loss) / length
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
 
 # ---------------- Trading (Advanced Trade) ----------------
 def _make_order_payload(product_id: str, usd_amount: Decimal) -> dict:
     return {
         "product_id": product_id,
         "side": "BUY",
-        "client_order_id": str(uuid.uuid4()),  # valid UUIDv4
+        "client_order_id": str(uuid.uuid4()),
         "order_configuration": {
             "market_market_ioc": {"quote_size": f"{usd_amount.normalize():f}"}
         },
     }
 
 def place_market_buy(product_id: str, usd_amount: Decimal, portfolio_uuid: Optional[str]) -> None:
-    """
-    Submit a market IOC BUY using quote_size=$, scoped by portfolio via QUERY PARAM.
-    NOTE: 'portfolio_id' must NOT be in the JSON body (it will 400).
-    """
     params = {}
     if portfolio_uuid:
         params["portfolio_id"] = portfolio_uuid
-
     payload = _make_order_payload(product_id, usd_amount)
-
     try:
         resp = client.post("/api/v3/brokerage/orders", params=params, data=payload)
         oid = (_get(resp, "order_id") or _get(resp, "orderId")
                or _get(_get(resp, "success_response", {}) or {}, "order_id"))
         log(f"{product_id} | BUY ${usd_amount} submitted (order {oid})")
-        return
     except Exception as e:
-        # If server complains about client_order_id, retry once with a fresh UUID
         msg = str(e)
         if "client_order_id" in msg:
             dbg(f"{product_id} | retrying with fresh client_order_id due to error: {e}")
@@ -337,57 +277,70 @@ def place_market_buy(product_id: str, usd_amount: Decimal, portfolio_uuid: Optio
 
 # ---------------- Main ----------------
 def main():
-    # Decide sizing mode
-    buy_pct = D(BUY_PCT_STR) if BUY_PCT_STR else D("0")
+    buy_pct = D(BUY_PCT_STR) if BUY_PCT_STR else D("0.05")
     usd_amt_fixed = D(BUY_USD_STR)
 
-    eff_per_req = 100  # Exchange per-request max
-    log(f"Started | mode={'PCT' if buy_pct > 0 else 'USD'} | buy_pct={buy_pct} | buy_usd={usd_amt_fixed} | quote={QUOTE} | "
-        f"max_products={MAX_PRODUCTS} | trades_limit_req={TRADES_LIMIT} | trades_limit_eff_per_req={eff_per_req} | min_trades={MIN_TRADES}")
+    log(f"Started scan | mode={'PCT' if buy_pct > 0 else 'USD'} | buy_pct={buy_pct} | quote={QUOTE} | MAX_PRODUCTS={MAX_PRODUCTS}")
     pf = ensure_portfolio_uuid()
 
-    if TOP_OVERRIDE:
-        forced_pid = f"{TOP_OVERRIDE}-{QUOTE}"
-        log(f"Using TOP_TICKER_OVERRIDE={TOP_OVERRIDE} -> {forced_pid}")
-        choice = (TOP_OVERRIDE, forced_pid, Decimal("1"), 0)
-    else:
-        products = fetch_usd_products()
-        if not products:
-            log("No USD products found; aborting.")
-            raise SystemExit(1)
+    products = fetch_usd_products()
+    if not products:
+        log("No USD products found; aborting.")
+        raise SystemExit(1)
 
-        choice = pick_top_by_ratio(products)
-        if not choice:
-            log("Could not determine a top symbol (not enough trades or API blocked); aborting.")
-            raise SystemExit(1)
+    total_signals = 0
+    total_buys = 0
 
-    base, pid, ratio, n = choice
-    log(f"Selected top: {base} via {pid} (buy_ratio={ratio:.2%}, trades={n})")
+    for p in products:
+        pid  = str(_get(p, "product_id") or "")
+        base = str(_get(p, "base_currency_id") or _get(p, "base_currency") or "").upper()
+        if not pid or not base:
+            continue
 
-    # Build notional based on mode (percent of buying power vs fixed)
-    meta = get_product_meta(pid)
-    quote_bal = get_quote_available(meta["quote_ccy"])
-    if buy_pct > 0:
-        usd_amt = round_to_inc(quote_bal * buy_pct, meta["quote_inc"])
+        candles = get_candles_15m(pid, bars_needed=300)
+        if len(candles) < 240 + 14 + 1:
+            dbg(f"{pid} | not enough candles ({len(candles)}) for SMA240 & RSI14; skip.")
+            continue
+
+        closes = [c[4] for c in candles]  # close prices, oldest->newest
+        rsi14 = rsi_wilder_14(closes, 14)
+        sma60 = sma(closes, 60)
+        sma240 = sma(closes, 240)
+        if rsi14 is None or sma60 is None or sma240 is None:
+            continue
+
+        cond = (rsi14 <= 30.0) and (sma60 < sma240)
+        dbg(f"{pid} | RSI14={rsi14:.2f} SMA60={sma60:.6f} SMA240={sma240:.6f} -> signal={cond}")
+        if not cond:
+            continue
+
+        total_signals += 1
+        # Sizing per qualifying asset: 5% of *current* available USD (or fixed)
+        meta = get_product_meta(pid)
+        quote_bal = get_quote_available(meta["quote_ccy"])
+        if buy_pct > 0:
+            usd_amt = round_to_inc(quote_bal * buy_pct, meta["quote_inc"])
+        else:
+            usd_amt = round_to_inc(D(max(usd_amt_fixed, D("0"))), meta["quote_inc"])
+
         if usd_amt <= 0:
-            log(f"{pid} | Computed notional rounds to 0 (quote_bal={quote_bal}, pct={buy_pct}); aborting.")
-            raise SystemExit(1)
+            log(f"{pid} | Computed notional rounds to 0 (quote_bal={quote_bal}, pct={buy_pct}); skipping.")
+            continue
         if meta["quote_min"] and usd_amt < meta["quote_min"]:
-            log(f"{pid} | Notional {usd_amt} < quote_min {meta['quote_min']}; aborting.")
-            raise SystemExit(1)
-        log(f"{pid} | quote_bal={quote_bal} {meta['quote_ccy']} | pct={buy_pct} -> buy_notional=${usd_amt}")
-    else:
-        usd_amt = D(usd_amt_fixed)
-        if usd_amt <= 0:
-            raise SystemExit("BUY_USD must be > 0")
-        usd_amt = round_to_inc(usd_amt, meta["quote_inc"])
-        if meta["quote_min"] and usd_amt < meta["quote_min"]:
-            log(f"{pid} | Notional {usd_amt} < quote_min {meta['quote_min']}; aborting.")
-            raise SystemExit(1)
-        log(f"{pid} | fixed buy_notional=${usd_amt}")
+            log(f"{pid} | Notional {usd_amt} < quote_min {meta['quote_min']}; skipping.")
+            continue
 
-    place_market_buy(pid, usd_amt, pf)
-    log("Done.")
+        log(f"{pid} | SIGNAL ✅ | RSI14={rsi14:.2f} <= 30 and SMA60<SMA240 | buy_notional=${usd_amt}")
+        try:
+            place_market_buy(pid, usd_amt, pf)
+            total_buys += 1
+        except Exception:
+            # already logged in place_market_buy
+            pass
+
+        time.sleep(0.1)  # gentle pacing
+
+    log(f"Scan complete | signals={total_signals} | buys={total_buys}")
 
 if __name__ == "__main__":
     main()
