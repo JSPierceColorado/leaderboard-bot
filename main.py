@@ -13,7 +13,7 @@ Action:
 Behavior:
 - Runs forever. Aligns to the close of each 15m bar (00, 15, 30, 45 past the hour).
 - Scans all USD-quoted products (no MAX cap).
-- Intentionally allows repeat buys whenever the signal is met (no per-bar de-dupe).
+- Intentionally allows repeat buys whenever the signal is met.
 
 Env
 ---
@@ -36,6 +36,7 @@ ALLOWLIST=
 # How often to refresh product list (seconds):
 PRODUCT_REFRESH_SECS=3600
 
+# Set DEBUG=1 to see per-asset metrics each bar
 DEBUG=1
 
 Requires
@@ -74,6 +75,9 @@ def log(msg: str) -> None:
 def dbg(msg: str) -> None:
     if DEBUG:
         print(f"[cb-rsi-buyer-live][debug] {msg}", flush=True)
+
+def fmt_ts(ts: int) -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(ts))
 
 # ---------------- Helpers ----------------
 def D(x: str | Decimal | float | int) -> Decimal:
@@ -327,15 +331,25 @@ def main():
                 continue
 
             closes = [c[4] for c in candles]
+            latest_bar_ts = candles[-1][0]
+            latest_close = closes[-1]
 
             rsi14 = rsi_wilder_14(closes, 14)
             sma60 = sma(closes, 60)
             sma240 = sma(closes, 240)
             if rsi14 is None or sma60 is None or sma240 is None:
+                dbg(f"{pid} | metrics unavailable rsi14={rsi14} sma60={sma60} sma240={sma240}")
                 continue
 
             cond = (rsi14 <= 30.0) and (sma60 < sma240)
-            dbg(f"{pid} | RSI14={rsi14:.2f} SMA60={sma60:.6f} SMA240={sma240:.6f} -> signal={cond}")
+
+            # ---- per-asset visibility line ----
+            dbg(
+                f"{pid} | bar={fmt_ts(latest_bar_ts)} | close={latest_close:.8f} | "
+                f"RSI14={rsi14:.2f} | SMA60={sma60:.8f} | SMA240={sma240:.8f} | "
+                f"candles={len(candles)} | signal={cond}"
+            )
+
             if not cond:
                 continue
 
@@ -356,7 +370,10 @@ def main():
                 log(f"{pid} | Notional {usd_amt} < quote_min {meta['quote_min']}; skipping.")
                 continue
 
-            log(f"{pid} | SIGNAL ✅ | RSI14={rsi14:.2f} <= 30 and SMA60<SMA240 | buy_notional=${usd_amt}")
+            log(
+                f"{pid} | SIGNAL ✅ | {fmt_ts(latest_bar_ts)} | "
+                f"RSI14={rsi14:.2f} <= 30 and SMA60<SMA240 | buy_notional=${usd_amt}"
+            )
             try:
                 place_market_buy(pid, usd_amt, pf)
                 total_buys += 1
