@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Perpetual 15m-bar scanner & buyer for ALL Coinbase USD markets.
+Perpetual 15m-bar scanner & buyer for ALL Coinbase USD markets (closed-only candles).
 
-Rule (15m timeframe):
+Rules (15m timeframe):
 - RSI(14) <= 30
 - SMA(60) < SMA(240)
 
@@ -11,9 +11,10 @@ Action:
 - No caps/limits on number of products scanned or buys.
 
 Behavior:
-- Runs forever. Aligns to the close of each 15m bar (00, 15, 30, 45 past the hour).
+- Runs forever. Aligns to each 15m bar close (00, 15, 30, 45 past the hour).
 - Scans all USD-quoted products (no MAX cap).
 - Intentionally allows repeat buys whenever the signal is met.
+- Uses **closed-only** candles to match charting platforms.
 
 Env
 ---
@@ -36,8 +37,11 @@ ALLOWLIST=
 # How often to refresh product list (seconds):
 PRODUCT_REFRESH_SECS=3600
 
-# Set DEBUG=1 to see per-asset metrics each bar
+# Set DEBUG=1 to see per-asset metrics each bar:
 DEBUG=1
+
+# Force closed-only behavior (recommended: leave ON)
+STRICT_CLOSED_ONLY=1
 
 Requires
 --------
@@ -65,6 +69,7 @@ ALLOWLIST_RAW   = os.getenv("ALLOWLIST", "").strip()
 ALLOWLIST       = {s.strip().upper() for s in ALLOWLIST_RAW.split(",") if s.strip()} if ALLOWLIST_RAW else set()
 PRODUCT_REFRESH_SECS = int(os.getenv("PRODUCT_REFRESH_SECS", "3600"))
 DEBUG           = os.getenv("DEBUG", "0").lower() not in ("0", "false", "no", "off", "")
+STRICT_CLOSED_ONLY = os.getenv("STRICT_CLOSED_ONLY", "1").lower() not in ("0","false","no","off","")
 
 client = RESTClient()  # uses COINBASE_API_KEY / COINBASE_API_SECRET
 
@@ -188,20 +193,36 @@ def fetch_usd_products() -> List[dict]:
     dbg(f"USD products considered: {len(usd_products)}")
     return usd_products
 
-# ---------------- Exchange public API: 15m candles ----------------
+# ---------------- Exchange public API: 15m candles (CLOSED ONLY) ----------------
 EXCHANGE_BASE = "https://api.exchange.coinbase.com"
+FIFTEEN_MIN = 900
+
+def last_closed_bar_boundary(ts: Optional[int] = None) -> int:
+    """Return the UNIX epoch for the *start* of the most recently CLOSED 15m bar."""
+    if ts is None:
+        ts = int(time.time())
+    current_bucket = (ts // FIFTEEN_MIN) * FIFTEEN_MIN
+    return current_bucket - FIFTEEN_MIN
 
 def get_candles_15m(pid: str, bars_needed: int = 300) -> List[Tuple[int, float, float, float, float, float]]:
     """
     Return recent 15m candles for product_id, oldest -> newest.
     Each item: (time, low, high, open, close, volume)
+    Uses **closed-only** candles if STRICT_CLOSED_ONLY is True.
     """
-    granularity = 900  # 15 minutes
-    now = int(time.time())
-    window_secs = granularity * max(bars_needed, 300)
-    params = {"granularity": granularity, "start": now - window_secs, "end": now}
+    granularity = FIFTEEN_MIN
+
+    if STRICT_CLOSED_ONLY:
+        end_ts = last_closed_bar_boundary()
+    else:
+        end_ts = int(time.time())
+
+    start_ts = end_ts - granularity * max(bars_needed, 300)
+
+    params = {"granularity": granularity, "start": start_ts, "end": end_ts}
     url = f"{EXCHANGE_BASE}/products/{pid}/candles"
     headers = {"User-Agent": "cb-rsi-buyer-live/1.0", "Accept": "application/json"}
+
     try:
         r = requests.get(url, headers=headers, params=params, timeout=20)
         r.raise_for_status()
@@ -209,6 +230,11 @@ def get_candles_15m(pid: str, bars_needed: int = 300) -> List[Tuple[int, float, 
         if not isinstance(data, list):
             return []
         data.sort(key=lambda x: x[0])  # oldest first
+
+        # Extra guard: drop any candle at or after end_ts (shouldn't appear, but be safe)
+        if STRICT_CLOSED_ONLY:
+            data = [row for row in data if int(row[0]) < end_ts]
+
         return [(int(t), float(lo), float(hi), float(op), float(cl), float(v)) for t, lo, hi, op, cl, v in data]
     except Exception as e:
         dbg(f"{pid} | candles fetch error: {e}")
@@ -237,7 +263,7 @@ def rsi_wilder_14(closes: List[float], length: int = 14) -> Optional[float]:
         gain = max(diff, 0.0)
         loss = max(-diff, 0.0)
         avg_gain = (avg_gain * (length - 1) + gain) / length
-    avg_loss = (avg_loss * (length - 1) + loss) / length
+        avg_loss = (avg_loss * (length - 1) + loss) / length
     if avg_loss == 0:
         return 100.0
     rs = avg_gain / avg_loss
@@ -278,16 +304,15 @@ def place_market_buy(product_id: str, usd_amount: Decimal, portfolio_uuid: Optio
         raise
 
 # ---------------- Scheduling: align to 15m bars ----------------
-FIFTEEN_MIN = 900
-
 def next_bar_epoch(now: Optional[int] = None) -> int:
     """Return the UNIX epoch for the *next* 15m bar boundary."""
+    FIFTEEN_MIN = 900
     if now is None:
         now = int(time.time())
     return ((now // FIFTEEN_MIN) + 1) * FIFTEEN_MIN
 
-def sleep_until(ts: int, pad_seconds: int = 3) -> None:
-    """Sleep until ts + small pad (to let the exchange finalize the bar)."""
+def sleep_until(ts: int, pad_seconds: int = 2) -> None:
+    """Sleep until ts + small pad; candles fetch still uses last CLOSED bar."""
     delay = ts - int(time.time()) + pad_seconds
     if delay > 0:
         time.sleep(delay)
@@ -297,7 +322,8 @@ def main():
     buy_pct = D(BUY_PCT_STR) if BUY_PCT_STR else D("0.05")
     usd_amt_fixed = D(BUY_USD_STR)  # ignored if buy_pct > 0
 
-    log(f"Started LIVE | mode={'PCT' if buy_pct > 0 else 'USD'} | buy_pct={buy_pct} | quote={QUOTE} | no caps/limits")
+    mode = 'PCT' if buy_pct > 0 else 'USD'
+    log(f"Started LIVE | mode={mode} | buy_pct={buy_pct} | quote={QUOTE} | no caps/limits | closed_only={STRICT_CLOSED_ONLY}")
     pf = ensure_portfolio_uuid()
 
     products: List[dict] = []
@@ -311,9 +337,9 @@ def main():
             products_last_refresh = now
             log(f"Products refreshed: {len(products)} USD markets")
 
-        # Wait for the next bar boundary
+        # Wait for the next bar boundary; candles function will use last CLOSED bar
         boundary = next_bar_epoch(now)
-        sleep_until(boundary, pad_seconds=5)
+        sleep_until(boundary, pad_seconds=3)
 
         cycle_start = int(time.time())
         total_signals = 0
@@ -331,7 +357,7 @@ def main():
                 continue
 
             closes = [c[4] for c in candles]
-            latest_bar_ts = candles[-1][0]
+            latest_bar_ts = candles[-1][0]  # should be the start time of the last CLOSED bar
             latest_close = closes[-1]
 
             rsi14 = rsi_wilder_14(closes, 14)
@@ -343,7 +369,7 @@ def main():
 
             cond = (rsi14 <= 30.0) and (sma60 < sma240)
 
-            # ---- per-asset visibility line ----
+            # per-asset visibility
             dbg(
                 f"{pid} | bar={fmt_ts(latest_bar_ts)} | close={latest_close:.8f} | "
                 f"RSI14={rsi14:.2f} | SMA60={sma60:.8f} | SMA240={sma240:.8f} | "
